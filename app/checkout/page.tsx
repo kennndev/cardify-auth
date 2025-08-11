@@ -104,19 +104,30 @@ export default function CheckoutPage() {
     : undefined
 
   return (
-    <div className="container mx-auto max-w-2xl px-4 py-8">
-      <Card>
-        <CardHeader><CardTitle className="text-2xl text-center">Complete Your Purchase</CardTitle></CardHeader>
-        <CardContent>
-          {clientSecret && options ? (
-            <Elements stripe={stripePromise} options={options} key={clientSecret}>
-              <CheckoutForm paymentIntentId={paymentIntentId} />
-            </Elements>
-          ) : (
-            <p className="text-center py-12">Loading payment form…</p>
-          )}
-        </CardContent>
-      </Card>
-    </div>
+<div className="flex items-center justify-center min-h-screen">
+  <div className="container mx-auto max-w-2xl px-4 py-8">
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-2xl text-center">
+          Complete Your Purchase
+        </CardTitle>
+      </CardHeader>
+      <CardContent>
+        {clientSecret && options ? (
+          <Elements
+            stripe={stripePromise}
+            options={options}
+            key={clientSecret}
+          >
+            <CheckoutForm paymentIntentId={paymentIntentId} />
+          </Elements>
+        ) : (
+          <p className="text-center py-12">Loading payment form…</p>
+        )}
+      </CardContent>
+    </Card>
+  </div>
+</div>
+
   )
 }
