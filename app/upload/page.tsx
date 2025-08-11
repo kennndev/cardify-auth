@@ -13,6 +13,9 @@ import { Upload, AlertCircle, ArrowRight, Sparkles, Loader2 } from 'lucide-react
 import { Checkbox } from "@/components/ui/checkbox"
 import { cropImageToAspectRatio } from "@/lib/image-processing"
 import { uploadToSupabase } from "@/lib/upload"
+import { canCreateMore, incrementGuestCreation, getRemaining, FREE_LIMIT } from "@/lib/guest-quota"
+import { getSupabaseBrowserClient, signInWithGoogle } from "@/lib/supabase-browser"
+import { useToast } from "@/hooks/use-toast"
 
 export default function UploadPage() {
   const [uploadedImage, setUploadedImage] = useState<string | null>("/example-card_cardify.webp")
@@ -43,6 +46,31 @@ export default function UploadPage() {
   const [tooltipVisible, setTooltipVisible] = useState(false)
   const desktopButtonRef = useRef<HTMLDivElement>(null)
   const tooltipTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+  const [user, setUser] = useState<any>(null)
+const { toast } = useToast()
+// near other state
+const [remaining, setRemaining] = useState<number>(getRemaining())
+
+useEffect(() => {
+  const onUpdate = () => setRemaining(getRemaining())
+  window.addEventListener("cardify-free-updated", onUpdate)
+  window.addEventListener("storage", onUpdate)
+  return () => {
+    window.removeEventListener("cardify-free-updated", onUpdate)
+    window.removeEventListener("storage", onUpdate)
+  }
+}, [])
+
+
+useEffect(() => {
+  const supabase = getSupabaseBrowserClient()
+  supabase.auth.getUser().then(({ data }) => setUser(data.user ?? null))
+  const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
+    setUser(session?.user ?? null)
+  })
+  return () => sub.subscription.unsubscribe()
+}, [])
+
 
   // Clean up object URLs when component unmounts or image changes
   useEffect(() => {
@@ -165,37 +193,55 @@ export default function UploadPage() {
     }
   }
 
-  const handleFinalizeClick = async () => {
-    if (!uploadedImage || !hasAgreed) return
-    
-    setIsUploadingToDatabase(true)
-    setUploadError(null)
-    
-    try {
-      // Upload image to Supabase if we haven't already
-      if (!uploadedImageUrl && processedImageBlob) {
-        console.log('📤 Uploading image to database...')
-        const uploadData = await uploadToSupabase(processedImageBlob)
-        setUploadedImageUrl(uploadData.publicUrl)
-        console.log('✅ Image uploaded successfully:', uploadData.publicUrl)
-      } else if (!uploadedImageUrl && uploadedImage) {
-        // Fallback to uploading the original image if no processed blob
-        console.log('📤 Uploading original image to database...')
-        const imageBlob = await fetch(uploadedImage).then(r => r.blob())
-        const uploadData = await uploadToSupabase(imageBlob)
-        setUploadedImageUrl(uploadData.publicUrl)
-        console.log('✅ Image uploaded successfully:', uploadData.publicUrl)
-      }
-      
-      // Open the checkout modal after successful upload
-      setShowCheckoutModal(true)
-    } catch (error) {
-      console.error('❌ Failed to upload image:', error)
-      setUploadError(error instanceof Error ? error.message : 'Failed to upload image. Please try again.')
-    } finally {
-      setIsUploadingToDatabase(false)
-    }
+const handleFinalizeClick = async () => {
+  if (!uploadedImage || !hasAgreed) return
+
+  // 1) Gate for guests
+  if (!user && !canCreateMore()) {
+    toast({
+      title: "Sign in required",
+      description: "You’ve used your 3 free creations. Sign in to continue.",
+    })
+    // Send them to /upload after sign-in
+    signInWithGoogle("/upload")
+    return
   }
+
+  setIsUploadingToDatabase(true)
+  setUploadError(null)
+
+  try {
+    // 2) Upload image (your existing code)
+    if (!uploadedImageUrl && processedImageBlob) {
+      const uploadData = await uploadToSupabase(processedImageBlob)
+      setUploadedImageUrl(uploadData.publicUrl)
+    } else if (!uploadedImageUrl && uploadedImage) {
+      const imageBlob = await fetch(uploadedImage).then(r => r.blob())
+      const uploadData = await uploadToSupabase(imageBlob)
+      setUploadedImageUrl(uploadData.publicUrl)
+    }
+
+    // 3) Count as a successful creation for guests
+ if (!user) {
+  incrementGuestCreation()
+  setRemaining(getRemaining()) // keep badge in sync
+  toast({
+    title: "Created!",
+    description: `You have ${getRemaining()} of ${FREE_LIMIT} free remaining.`,
+  })
+}
+
+
+    // 4) Open checkout modal
+    setShowCheckoutModal(true)
+  } catch (error) {
+    console.error('❌ Failed to upload image:', error)
+    setUploadError(error instanceof Error ? error.message : 'Failed to upload image. Please try again.')
+  } finally {
+    setIsUploadingToDatabase(false)
+  }
+}
+
 
   return (
     <div className="min-h-screen bg-cyber-black relative overflow-hidden font-mono">
@@ -235,10 +281,16 @@ export default function UploadPage() {
       <div className="px-6 py-8 pt-24 relative">
         <div className="max-w-7xl mx-auto">
           <div className="mb-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-            <div>
-              <h1 className="text-2xl sm:text-3xl font-bold text-white mb-2 tracking-wider">Upload Your Own Artwork</h1>
-              <p className="text-gray-400">Create custom trading cards with your own designs</p>
-            </div>
+       <div className="flex items-center gap-2">
+  <h1 className="text-2xl sm:text-3xl font-bold text-white mb-2 tracking-wider">Upload Your Own Artwork</h1>
+{!user && (
+  <span className="text-xs px-2 py-0.5 rounded border border-cyber-cyan/40 text-cyber-cyan">
+    {remaining} / {FREE_LIMIT} free
+  </span>
+)}
+
+</div>
+
             <Button
               onClick={() => setShowAIModal(true)}
               className="cyber-button w-full sm:w-auto"
@@ -356,15 +408,26 @@ export default function UploadPage() {
                       onMouseEnter={handleMouseEnter}
                       onMouseLeave={handleMouseLeave}
                     >
-                      <Button
-                        disabled={!uploadedImage || !hasAgreed || isUploadingToDatabase}
-                        onClick={handleFinalizeClick}
-                        className={`w-full text-lg py-6 tracking-wider transition-all duration-300 ${
-                          uploadedImage && hasAgreed
-                            ? "cyber-button"
-                            : "bg-gray-800 border-2 border-gray-600 text-gray-500 cursor-not-allowed opacity-50"
-                        }`}
-                      >
+                   <Button
+  disabled={
+    !uploadedImage ||
+    !hasAgreed ||
+    isUploadingToDatabase ||
+    (!user && !canCreateMore())
+  }
+  onClick={handleFinalizeClick}
+  className={`w-full text-lg py-6 tracking-wider transition-all duration-300 ${
+    uploadedImage && hasAgreed && (user || canCreateMore())
+      ? "cyber-button"
+      : "bg-gray-800 border-2 border-gray-600 text-gray-500 cursor-not-allowed opacity-50"
+  }`}
+  title={
+    !user && !canCreateMore()
+      ? "Free limit reached — sign in to continue"
+      : getTooltipMessage()
+  }
+>
+
                         {isUploadingToDatabase ? (
                           <>
                             <Loader2 className="w-5 h-5 mr-2 animate-spin" />

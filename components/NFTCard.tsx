@@ -55,6 +55,7 @@ async function fetchWithFallback(pathOrHttp: string, timeoutMs = 6000): Promise<
 export default function NFTCard({ collection, id, height = 260 }: Props) {
   const client = usePublicClient({ chainId: BASE_SEPOLIA })
   const [img, setImg] = useState<string | null>(null)
+  const [name, setName] = useState<string>('')
   const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
@@ -71,9 +72,10 @@ export default function NFTCard({ collection, id, height = 260 }: Props) {
         const meta = await fetchWithFallback(uri)  // JSON
         let imageUrl: string = meta?.image || meta?.image_url || ''
         if (imageUrl && !imageUrl.startsWith('http')) {
-          imageUrl = GATEWAYS[0](ipfsToPath(imageUrl)) // first gateway
+          imageUrl = GATEWAYS[0](ipfsToPath(imageUrl))
         }
         setImg(imageUrl || '')
+        setName(meta?.name || `NFT #${id.toString()}`)
       } catch (e: any) {
         setErr(e?.message || 'Failed to load metadata')
       }
@@ -94,13 +96,13 @@ export default function NFTCard({ collection, id, height = 260 }: Props) {
     <div className="rounded overflow-hidden border shadow-sm">
       <Image
         src={img}
-        alt={`NFT #${id.toString()}`}
+        alt={name}
         width={400}
         height={height}
         className="w-full object-cover"
       />
-      <div className="p-2 text-center text-sm font-medium">
-        #{id.toString()}
+      <div className="p-2 text-center text-sm font-medium text-white">
+        {name} — #{id.toString()}
       </div>
     </div>
   )

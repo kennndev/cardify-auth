@@ -2,15 +2,13 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { loadStripe, type Stripe } from '@stripe/stripe-js'
-import {
-  Elements, PaymentElement, useElements, useStripe,
-} from '@stripe/react-stripe-js'
+import { Elements, PaymentElement, useElements, useStripe } from '@stripe/react-stripe-js'
 import { useSearchParams, useRouter } from 'next/navigation'
-import { createClientComponentClient } from '@supabase/auth-helpers-nextjs'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { useToast } from '@/hooks/use-toast'
 
+/** Load Stripe for the (optional) connected account */
 function useStripeLoader(acct: string | null) {
   return useMemo<Promise<Stripe | null>>(
     () => loadStripe(
@@ -44,11 +42,12 @@ function CheckoutForm({ paymentIntentId }: { paymentIntentId: string }) {
       confirmParams: { return_url: `${location.origin}/payment-success?payment_intent=${paymentIntentId}` },
       redirect: 'if_required',
     })
-    if (error)
-      toast({ title: 'Payment failed', description: error.message, variant: 'destructive' })
-    else if (paymentIntent?.status === 'succeeded')
-      router.push(`/payment-success?payment_intent=${paymentIntent.id}`)
 
+    if (error) {
+      toast({ title: 'Payment failed', description: error.message, variant: 'destructive' })
+    } else if (paymentIntent?.status === 'succeeded') {
+      router.push(`/payment-success?payment_intent=${paymentIntent.id}`)
+    }
     setBusy(false)
   }
 
@@ -67,46 +66,49 @@ export default function CheckoutPage() {
   const [paymentIntentId, setPaymentIntentId] = useState('')
   const [stripeAcct,      setStripeAcct]      = useState<string | null>(null)
 
-  const search = useSearchParams()
-  const cardId = search.get('cardId')
-  const amount = search.get('amount')
+  const params = useSearchParams()
+  const listingId = params.get('listingId')
 
   const stripePromise = useStripeLoader(stripeAcct)
-  const supabase = createClientComponentClient()
 
   useEffect(() => {
-    if (!amount || !cardId) return
+    if (!listingId) return
 
     ;(async () => {
-      const { data: { user } } = await supabase.auth.getUser()
-      if (!user) return
+      try {
+        console.log('[checkout] creating PI for listing', listingId)
+        const res = await fetch('/api/create-payment-intent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ listingId }),
+        })
 
-      const res = await fetch('/api/create-payment-intent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amount: +amount, cardId, buyerId: user.id }),
-      })
+        if (!res.ok) {
+          console.error('[create-payment-intent]', await res.text())
+          return
+        }
 
-      if (!res.ok) {
-        console.error('[create-payment-intent]', await res.text())
-        return
+        const { clientSecret, paymentIntentId, stripeAccount } = await res.json()
+        console.log('[checkout] PI', paymentIntentId, 'acct', stripeAccount ?? 'platform')
+        setClientSecret(clientSecret)
+        setPaymentIntentId(paymentIntentId)
+        setStripeAcct(stripeAccount) // null -> platform, acct_... -> connected account
+      } catch (e) {
+        console.error('[checkout] failed to create PI', e)
       }
-
-      const { clientSecret, paymentIntentId, stripeAccount } = await res.json()
-      setClientSecret(clientSecret)
-      setPaymentIntentId(paymentIntentId)
-      setStripeAcct(stripeAccount)      // null → platform, acct_… → seller
     })()
-  }, [amount, cardId])
+  }, [listingId])
 
-  const options = { clientSecret, appearance: { theme: 'stripe' as const } }
+  const options = clientSecret
+    ? { clientSecret, appearance: { theme: 'stripe' as const } }
+    : undefined
 
   return (
     <div className="container mx-auto max-w-2xl px-4 py-8">
       <Card>
         <CardHeader><CardTitle className="text-2xl text-center">Complete Your Purchase</CardTitle></CardHeader>
         <CardContent>
-          {clientSecret ? (
+          {clientSecret && options ? (
             <Elements stripe={stripePromise} options={options} key={clientSecret}>
               <CheckoutForm paymentIntentId={paymentIntentId} />
             </Elements>

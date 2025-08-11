@@ -1,54 +1,77 @@
 // app/api/stripe-webhook/route.ts
-import { NextRequest, NextResponse } from "next/server"
-import { getStripeServer } from "@/lib/stripe"
-import { createClient } from "@supabase/supabase-js"
-import type Stripe from "stripe"
+import { NextRequest, NextResponse } from "next/server";
+import { getStripeServer } from "@/lib/stripe";
+import { createClient } from "@supabase/supabase-js";
+import type Stripe from "stripe";
 
-/* ───────────────────────── runtime ─────────────────────────── */
-export const runtime = "nodejs"   // Buffer + supabase-js need Node
+export const runtime = "nodejs"; // ensure raw body available
 
-// Server-role client (SERVER ONLY)
+// admin client
 const admin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_KEY!
-)
+);
 
-// Stripe instance for MARKETPLACE tenant
-const stripe = getStripeServer("market")
+const stripe = getStripeServer("market");
 
-/* ───────────────── helper: mark tx, listing, payout ───────── */
-async function handleSucceeded(pi: Stripe.PaymentIntent) {
-  const stripeId   = pi.id
-  const listingId  = (pi.metadata as any)?.mkt_listing_id
-  const buyerId    = (pi.metadata as any)?.mkt_buyer_id
-  const sellerId   = (pi.metadata as any)?.mkt_seller_id
+/* helpers */
 
-  if (!listingId || !buyerId) {
-    console.warn("[webhook] missing listingId/buyerId in PI metadata", pi.metadata)
-    return
+async function markSellerReadiness(acct: Stripe.Account) {
+  const verified =
+    acct.charges_enabled === true &&
+    acct.payouts_enabled === true &&
+    ((acct.requirements?.currently_due ?? []).length === 0);
+
+  const userId = (acct.metadata as any)?.user_id as string | undefined;
+
+  if (userId) {
+    await admin
+      .from("mkt_profiles")
+      .upsert(
+        {
+          id: userId,
+          email: null,
+          stripe_account_id: acct.id,
+          stripe_verified: verified,
+          is_seller: verified,
+        },
+        { onConflict: "id" }
+      );
   }
 
-  // Amounts are in cents
-  const amountCents = typeof pi.amount === "number" ? pi.amount : Number(pi.amount)
-  const platformFeeCents =
-    typeof pi.application_fee_amount === "number"
-      ? (pi.application_fee_amount ?? 0)
-      : Number(pi.application_fee_amount ?? 0)
-  const netCents = Math.max(0, amountCents - platformFeeCents)
+  await admin
+    .from("mkt_profiles")
+    .update({ stripe_verified: verified, is_seller: verified })
+    .eq("stripe_account_id", acct.id);
+}
 
-  /* 1) Flip transaction row to completed */
-  // First try by stripe_payment_id
+async function handleSucceeded(pi: Stripe.PaymentIntent) {
+  const stripeId = pi.id;
+  const md = (pi.metadata ?? {}) as any;
+  const listingId = md.mkt_listing_id;
+  const buyerId = md.mkt_buyer_id;
+  const sellerId = md.mkt_seller_id;
+
+  if (!listingId || !buyerId) {
+    console.warn("[wh] missing metadata", md);
+    return;
+  }
+
+  const amountCents = Number(pi.amount);
+  const platformFeeCents = Number(pi.application_fee_amount ?? 0);
+  const netCents = Math.max(0, amountCents - platformFeeCents);
+
+  // 1) complete tx
   const { data: tx1, error: tx1Err } = await admin
     .from("mkt_transactions")
     .update({ status: "completed", updated_at: new Date().toISOString() })
     .eq("stripe_payment_id", stripeId)
-    .select("id")
+    .select("id");
 
-  if (tx1Err) console.error("[webhook] tx update by stripe_id error:", tx1Err.message)
+  if (tx1Err) console.error("[wh] tx by stripe_id error:", tx1Err.message);
 
   if (!tx1?.length) {
-    // Fallback by (listing,buyer) pending
-    const { data: tx2, error: tx2Err } = await admin
+    const { error: tx2Err } = await admin
       .from("mkt_transactions")
       .update({
         status: "completed",
@@ -57,90 +80,108 @@ async function handleSucceeded(pi: Stripe.PaymentIntent) {
       })
       .eq("listing_id", listingId)
       .eq("buyer_id", buyerId)
-      .eq("status", "pending")
-      .select("id")
+      .eq("status", "pending");
 
-    if (tx2Err) console.error("[webhook] tx fallback update error:", tx2Err.message)
-    console.log(`[webhook] tx rows updated (fallback): ${tx2?.length ?? 0}`)
-  } else {
-    console.log(`[webhook] tx rows updated: ${tx1.length}`)
+    if (tx2Err) console.error("[wh] tx fallback error:", tx2Err.message);
   }
 
-  /* 2) Mark listing sold */
+  // 2) mark listing sold
   const { error: listErr } = await admin
     .from("mkt_listings")
-    .update({ buyer_id: buyerId, status: "sold", is_active: false, updated_at: new Date().toISOString() })
-    .eq("id", listingId)
+    .update({
+      buyer_id: buyerId,
+      status: "sold",
+      is_active: false,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", listingId);
 
-  if (listErr) console.error("[webhook] listing update error:", listErr.message)
+  if (listErr) console.error("[wh] listing update err:", listErr.message);
 
-  /* 3) Schedule payout if seller has a connected account */
-  if (!sellerId) return
-
+  // 3) queue payout
+  if (!sellerId) return;
   const { data: seller, error: sellerErr } = await admin
     .from("mkt_profiles")
     .select("stripe_account_id")
     .eq("id", sellerId)
-    .single()
+    .single();
 
   if (sellerErr) {
-    console.error("[webhook] fetch seller err:", sellerErr.message)
-    return
+    console.error("[wh] seller fetch err:", sellerErr.message);
+    return;
   }
-  if (!seller?.stripe_account_id) return // nothing to payout
+  if (!seller?.stripe_account_id) return;
 
-  const when = new Date(Date.now() + 10 * 60 * 1000) // T+10 minutes
-
-  const { error: payoutErr } = await admin
-    .from("mkt_payouts")
-    .insert({
-      listing_id: listingId,
-      stripe_account_id: seller.stripe_account_id,
-      amount_cents: netCents,
-      scheduled_at: when.toISOString(),
-      status: "pending",
-    })
-
-  if (payoutErr) {
-    console.error("[webhook] payout insert error:", payoutErr.message)
-  } else {
-    console.log(`[webhook] payout ${netCents}¢ → ${seller.stripe_account_id} @ ${when.toISOString()}`)
-  }
+  const when = new Date(Date.now() + 10 * 60 * 1000); // T+10 min
+  const { error: payoutErr } = await admin.from("mkt_payouts").insert({
+    listing_id: listingId,
+    stripe_account_id: seller.stripe_account_id,
+    amount_cents: netCents,
+    scheduled_at: when.toISOString(),
+    status: "pending",
+  });
+  if (payoutErr) console.error("[wh] payout insert err:", payoutErr.message);
 }
 
-/* ───────────────── route ───────────────────────────────────── */
+/* route */
+
 export async function POST(req: NextRequest) {
-  // A) raw body + signature verification
-  const raw = await req.arrayBuffer()
-  const sig = req.headers.get("stripe-signature") ?? ""
-  const secret = process.env.STRIPE_WEBHOOK_SECRET_MARKET || process.env.STRIPE_WEBHOOK_SECRET
-  if (!secret) {
-    console.error("[stripe-webhook] missing STRIPE_WEBHOOK_SECRET_MARKET")
-    return new NextResponse("server misconfigured", { status: 500 })
+  // raw body + signature
+  const raw = Buffer.from(await req.arrayBuffer());
+  const sig = req.headers.get("stripe-signature") ?? "";
+
+  const primary = process.env.STRIPE_WEBHOOK_SECRET;
+  const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET;
+
+  if (!primary && !connect) {
+    return new NextResponse("webhook secret missing", { status: 500 });
   }
 
-  let event: Stripe.Event
+  let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(Buffer.from(raw), sig, secret)
-  } catch (e: any) {
-    console.error("[stripe-webhook] bad signature:", e?.message ?? e)
-    return new NextResponse("bad sig", { status: 400 })
+    // try primary; fall back to connect secret
+    if (primary) {
+      event = stripe.webhooks.constructEvent(raw, sig, primary);
+    } else {
+      throw new Error("skip primary");
+    }
+  } catch (e) {
+    if (!connect) {
+      console.error("[wh] bad signature & no connect secret:", (e as any)?.message);
+      return new NextResponse("bad sig", { status: 400 });
+    }
+    try {
+      event = stripe.webhooks.constructEvent(raw, sig, connect);
+    } catch (e2) {
+      console.error("[wh] bad signature (both):", (e2 as any)?.message);
+      return new NextResponse("bad sig", { status: 400 });
+    }
   }
 
-  // B) ACK immediately
-  const res = NextResponse.json({ received: true })
+  // ACK immediately
+  const res = NextResponse.json({ received: true });
 
-  // C) Do work after ACK
-  ;(async () => {
+  // process async
+  (async () => {
     try {
-      if (event.type === "payment_intent.succeeded") {
-        await handleSucceeded(event.data.object as Stripe.PaymentIntent)
-      }
-      // Add more handlers as needed (refunds, failures, etc.)
-    } catch (err) {
-      console.error("[stripe-webhook] handler error:", err)
-    }
-  })()
+      switch (event.type) {
+        case "payment_intent.succeeded":
+          await handleSucceeded(event.data.object as Stripe.PaymentIntent);
+          break;
 
-  return res
+        case "account.updated":
+        case "capability.updated":
+        case "account.application.authorized":
+          await markSellerReadiness(event.data.object as Stripe.Account);
+          break;
+
+        default:
+          break;
+      }
+    } catch (err) {
+      console.error("[wh] handler error:", err);
+    }
+  })();
+
+  return res;
 }

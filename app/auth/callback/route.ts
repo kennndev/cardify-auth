@@ -8,9 +8,17 @@ export async function GET(request: Request) {
   const code = searchParams.get("code")
   const next = searchParams.get("next") ?? "/"
 
+  // safe redirect
+  const redirectUrl = next.startsWith("/") ? `${origin}${next}` : origin
+
   if (code) {
-    const supabase = createRouteHandlerClient({ cookies })
-    await supabase.auth.exchangeCodeForSession(code) // writes the session cookie
+    // NOTE: pass a *sync* function returning the cookie store
+    const supabase = createRouteHandlerClient({
+      cookies: () => cookies(),
+    })
+
+    await supabase.auth.exchangeCodeForSession(code) // sets session cookie
   }
-  return NextResponse.redirect(`${origin}${next}`)
+
+  return NextResponse.redirect(redirectUrl)
 }

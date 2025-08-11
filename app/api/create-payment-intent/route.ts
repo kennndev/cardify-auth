@@ -1,125 +1,122 @@
-import { NextRequest, NextResponse } from "next/server"
-import { getStripeServer } from "@/lib/stripe"
-import { cookies } from "next/headers"
-import { createClient } from "@supabase/supabase-js"
-import { createRouteHandlerClient } from "@supabase/auth-helpers-nextjs"
-import type Stripe from "stripe"
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
+import { createRouteHandlerClient } from '@supabase/auth-helpers-nextjs'
+import { cookies } from 'next/headers'
+import type Stripe from 'stripe'
+import { getStripeServer } from '@/lib/stripe'
 
-// SERVER-ROLE admin client (SERVER ONLY)
+export const dynamic = 'force-dynamic'
+
+// service-role (RLS bypass)
 const admin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY! // keep this consistent across project
+  process.env.SUPABASE_SERVICE_KEY!
 )
 
-export async function POST(req: NextRequest) {
-  const { amount, listingId, buyerId, platformFeePercent = 5 } = await req.json()
+const stripe = getStripeServer('market')
+const PLATFORM_FEE_PERCENT = 5
 
+export async function POST(req: NextRequest) {
+  const { listingId } = await req.json()
+  if (!listingId) {
+    return NextResponse.json({ error: 'Missing listingId' }, { status: 400 })
+  }
+
+  // IMPORTANT: pass the *function* `cookies` to the helper, not a resolved store
   const supabase = createRouteHandlerClient({ cookies })
   const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
-  if (!amount || !listingId || !buyerId) {
-    return NextResponse.json({ error: "Missing fields" }, { status: 400 })
-  }
+  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-  // 1) Look up listing & seller (bypass RLS with admin client)
-  const { data: listing, error: listingErr } = await admin
-    .from("mkt_listings")
-    .select("seller_id")
-    .eq("id", listingId)
+  // Get listing
+  const { data: listing, error: listErr } = await admin
+    .from('mkt_listings')
+    .select('id, price_cents, currency, status, is_active, seller_id')
+    .eq('id', listingId)
     .single()
 
-  if (listingErr || !listing) {
-    return NextResponse.json({ error: "Listing not found" }, { status: 404 })
+  if (listErr || !listing || !(listing.status === 'listed' && listing.is_active)) {
+    return NextResponse.json({ error: 'Listing unavailable' }, { status: 409 })
   }
 
+  // Get seller (can be null – add guard)
   const { data: seller, error: sellerErr } = await admin
-    .from("mkt_profiles")
-    .select("stripe_account_id, is_admin, email, stripe_verified")
-    .eq("id", listing.seller_id)
-    .single()
+    .from('mkt_profiles')
+    .select('stripe_account_id, is_admin, stripe_verified')
+    .eq('id', listing.seller_id)
+    .maybeSingle()
 
-  if (sellerErr || !seller) {
-    return NextResponse.json({ error: "Seller profile missing" }, { status: 500 })
+  if (sellerErr) {
+    return NextResponse.json({ error: 'Seller lookup failed' }, { status: 500 })
+  }
+  if (!seller) {
+    return NextResponse.json({ error: 'Seller profile missing' }, { status: 500 })
   }
 
-  // If seller isn’t admin, they must be connected (or however you gate sellers)
-  const stripeAcct = seller.is_admin ? undefined : seller.stripe_account_id ?? null
-  if (!seller.is_admin && !stripeAcct) {
-    return NextResponse.json({ error: "Seller not connected to Stripe" }, { status: 400 })
+  const stripeAcct = seller.is_admin ? undefined : (seller.stripe_account_id ?? null)
+  if (!seller.is_admin && (!stripeAcct || seller.stripe_verified !== true)) {
+    return NextResponse.json({ error: 'Seller not connected/verified with Stripe' }, { status: 400 })
   }
 
-  // 2) Money (store cents)
-  const amountCents = Math.round(Number(amount) * 100)
-  const feeCents = Math.round(amountCents * (Number(platformFeePercent) / 100))
+  const cents = listing.price_cents
+  const fee   = stripeAcct ? Math.round(cents * PLATFORM_FEE_PERCENT / 100) : undefined
 
-  // 3) Use the MARKETPLACE Stripe account
-  const stripe = getStripeServer("market")
-
-  // 4) Reuse pending transaction if exists
-  const { data: open } = await supabase
-    .from("mkt_transactions")
-    .select("id, stripe_payment_id")
-    .eq("listing_id", listingId)
-    .eq("buyer_id", buyerId)
-    .eq("status", "pending")
-    .single()
+  // Reuse pending tx if exists
+  const { data: open } = await admin
+    .from('mkt_transactions')
+    .select('id, stripe_payment_id')
+    .eq('listing_id', listing.id)
+    .eq('buyer_id', user.id)
+    .eq('status', 'pending')
+    .maybeSingle()
 
   const makePI = async (): Promise<Stripe.PaymentIntent> =>
     stripe.paymentIntents.create(
       {
-        amount: amountCents,
-        currency: "usd",
-        // Destination charge on connected account; take platform fee
-        application_fee_amount: stripeAcct ? feeCents : undefined,
+        amount: cents,
+        currency: (listing.currency || 'USD').toLowerCase(),
+        application_fee_amount: fee,              // auto-ignored when undefined
         metadata: {
-          mkt_listing_id: listingId,
-          mkt_buyer_id: buyerId,
-          mkt_seller_id: listing.seller_id,
+          mkt_listing_id: listing.id,
+          mkt_buyer_id:   user.id,
+          mkt_seller_id:  listing.seller_id,
         },
       },
-      // If seller is connected, create PI on their account
       stripeAcct ? { stripeAccount: stripeAcct } : undefined
     )
 
   let intent: Stripe.PaymentIntent
-
-  if (open) {
+  if (open?.stripe_payment_id) {
     intent = await stripe.paymentIntents.retrieve(
       open.stripe_payment_id,
       stripeAcct ? { stripeAccount: stripeAcct } : undefined
     )
-
-    // If old PI isn't usable, create a new one and update the row
-    if (intent.status !== "requires_payment_method") {
+    if (intent.status !== 'requires_payment_method') {
       intent = await makePI()
-      await supabase
-        .from("mkt_transactions")
-        .update({
-          stripe_payment_id: intent.id,
-          seller_acct: stripeAcct,
-          amount_cents: amountCents,
-          platform_fee_cents: feeCents,
-          currency: "USD",
-        })
-        .eq("id", open.id)
+      await admin.from('mkt_transactions').update({
+        stripe_payment_id : intent.id,
+        seller_acct       : stripeAcct ?? null,
+        platform_fee_cents: fee ?? 0,
+        amount_cents      : cents,
+        currency          : (listing.currency || 'USD').toUpperCase(),
+      }).eq('id', open.id)
     }
   } else {
     intent = await makePI()
-    await supabase.from("mkt_transactions").insert({
-      buyer_id: buyerId,
-      listing_id: listingId,
-      amount_cents: amountCents,
-      currency: "USD",
-      stripe_payment_id: intent.id,
-      status: "pending",
-      seller_acct: stripeAcct,
-      platform_fee_cents: feeCents,
+    await admin.from('mkt_transactions').insert({
+      buyer_id          : user.id,
+      listing_id        : listing.id,
+      amount_cents      : cents,
+      currency          : (listing.currency || 'USD').toUpperCase(),
+      stripe_payment_id : intent.id,
+      status            : 'pending',
+      seller_acct       : stripeAcct ?? null,
+      platform_fee_cents: fee ?? 0,
     })
   }
 
   return NextResponse.json({
-    clientSecret: intent.client_secret,
+    clientSecret   : intent.client_secret,
     paymentIntentId: intent.id,
-    stripeAccount: stripeAcct, // send back so client can use onElements if needed
+    stripeAccount  : stripeAcct ?? null,
   })
 }

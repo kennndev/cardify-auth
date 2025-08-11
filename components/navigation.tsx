@@ -1,40 +1,63 @@
-// components/Navigation.tsx
 "use client"
 
 import { Button } from "@/components/ui/button"
 import { Sparkles, ShoppingCart } from "lucide-react"
 import Link from "next/link"
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { useNavigationVisibility } from "@/hooks/use-navigation-visibility"
 import { AnimatedHamburger } from "@/components/ui/animated-hamburger"
 import { useCart } from "@/lib/cart-context"
 import { CartDrawer } from "@/components/cart-drawer"
 import { getSupabaseBrowserClient, signInWithGoogle, signOutUser } from "@/lib/supabase-browser"
+import { canCreateMore, getRemaining, FREE_LIMIT } from "@/lib/guest-quota"
 
 export function Navigation() {
   const [isMenuOpen, setIsMenuOpen] = useState(false)
   const [isCartOpen, setIsCartOpen] = useState(false)
   const [user, setUser] = useState<any>(null)
+  const [remaining, setRemaining] = useState<number>(0)
   const isVisible = useNavigationVisibility()
   const { getItemCount } = useCart()
   const itemCount = getItemCount()
 
+  const refreshRemaining = useCallback(() => {
+    setRemaining(getRemaining())
+  }, [])
+
+  useEffect(() => {
+    refreshRemaining()
+    const onUpdate = () => refreshRemaining()
+    window.addEventListener("cardify-free-updated", onUpdate)
+    window.addEventListener("storage", onUpdate)
+    return () => {
+      window.removeEventListener("cardify-free-updated", onUpdate)
+      window.removeEventListener("storage", onUpdate)
+    }
+  }, [refreshRemaining])
+
   useEffect(() => {
     const supabase = getSupabaseBrowserClient()
-
-    // initial load
     supabase.auth.getUser().then(({ data }) => {
-      console.log("[Nav] getUser:", data.user)
       setUser(data.user ?? null)
     })
-
-    // subscribe to changes
-    const { data: sub } = supabase.auth.onAuthStateChange((event, session) => {
-      console.log("[Nav] onAuthStateChange:", event, session?.user)
+    supabase.auth.getSession().then(({ data }) => {
+      setUser(data.session?.user ?? null)
+    })
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       setUser(session?.user ?? null)
     })
-    return () => { sub.subscription.unsubscribe() }
+    return () => sub.subscription.unsubscribe()
   }, [])
+
+  const handleGuestCreateClick = (path = "/upload") => {
+    if (canCreateMore()) {
+      // allow navigation to /upload
+      window.location.href = path
+    } else {
+      // gate: require sign-in and bring back to /upload
+      signInWithGoogle(path)
+    }
+  }
 
   return (
     <>
@@ -53,6 +76,12 @@ export function Navigation() {
                     Create Card
                   </Button>
                 </Link>
+                <Link href="/marketplace">
+                  <Button className="bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10">
+                    <Sparkles className="w-4 h-4 mr-2" />
+                    Marketplace
+                  </Button>
+                </Link>
                 <Link href="/profile">
                   <Button className="bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10">
                     <Sparkles className="w-4 h-4 mr-2" />
@@ -64,9 +93,22 @@ export function Navigation() {
                 </Button>
               </>
             ) : (
-              <Button onClick={() => signInWithGoogle("/profile")} className="bg-cyber-dark border-2 border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan/10">
-                Sign in with Google
-              </Button>
+              <>
+                {/* Guest Create: either go to /upload (if remaining) or force sign-in */}
+                <Button
+                  onClick={() => handleGuestCreateClick("/upload")}
+                  className="bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10"
+                  title={remaining > 0 ? `You have ${remaining} of ${FREE_LIMIT} free` : "Sign in required"}
+                >
+                  <Sparkles className="w-4 h-4 mr-2" />
+                  {remaining > 0 ? `Create Card (${remaining} free)` : "Create Card"}
+                </Button>
+
+                {/* Optional: explicit sign-in */}
+                <Button onClick={() => signInWithGoogle("/profile")} className="bg-cyber-dark border-2 border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan/10">
+                  Sign in with Google
+                </Button>
+              </>
             )}
 
             <Button
@@ -101,6 +143,12 @@ export function Navigation() {
                       Create Card
                     </Button>
                   </Link>
+                  <Link href="/marketplace" className="block">
+                    <Button onClick={() => setIsMenuOpen(false)} className="w-full bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10">
+                      <Sparkles className="w-4 h-4 mr-2" />
+                      Marketplace
+                    </Button>
+                  </Link>
                   <Link href="/profile" className="block">
                     <Button onClick={() => setIsMenuOpen(false)} className="w-full bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10">
                       <Sparkles className="w-4 h-4 mr-2" />
@@ -112,9 +160,20 @@ export function Navigation() {
                   </Button>
                 </>
               ) : (
-                <Button onClick={() => signInWithGoogle("/profile")} className="w-full bg-cyber-dark border-2 border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan/10">
-                  Sign in with Google
-                </Button>
+                <>
+                  <Button
+                    onClick={() => handleGuestCreateClick("/upload")}
+                    className="w-full bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10"
+                    title={remaining > 0 ? `You have ${remaining} of ${FREE_LIMIT} free` : "Sign in required"}
+                  >
+                    <Sparkles className="w-4 h-4 mr-2" />
+                    {remaining > 0 ? `Create Card (${remaining} free)` : "Create Card"}
+                  </Button>
+
+                  <Button onClick={() => signInWithGoogle("/profile")} className="w-full bg-cyber-dark border-2 border-cyber-cyan text-cyber-cyan hover:bg-cyber-cyan/10">
+                    Sign in with Google
+                  </Button>
+                </>
               )}
             </div>
           </div>

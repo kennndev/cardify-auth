@@ -26,7 +26,7 @@ const CustomCard3DPreviewWrapper = dynamic(() => import("./CustomCard3DPreviewWr
 import { ShippingAddressForm, type ShippingAddress } from "./shipping-address-form"
 import { Minus, Plus, ShoppingCart, Star, Zap, Shield, AlertCircle, Loader2, Eye, EyeOff, X, ShoppingBag } from "lucide-react"
 import { csrfFetch } from "@/lib/csrf-client"
-import { uploadToSupabase } from "@/lib/supabase-browser"
+import { uploadToSupabase } from "@/lib/upload"
 import { useCart } from "@/lib/cart-context"
 
 interface CustomCardCheckoutModalProps {

@@ -18,32 +18,67 @@ import { WalletButton } from "@/components/WalletConnect"
 
 const FACTORY = process.env.NEXT_PUBLIC_FACTORY_ADDRESS as `0x${string}`
 
-type UploadedImageRow = {
-  id: string; user_id: string; storage_path: string; image_url: string;
-  file_size_bytes: number | null; file_type: string | null; created_at: string | null
+/* ───────────────────── Types ───────────────────── */
+
+type AssetRow = {
+  id: string               // user_assets.id  (canonical id used by listings)
+  owner_id: string
+  title: string | null
+  image_url: string | null
+  storage_path: string | null
+  mime_type: string | null
+  size_bytes: number | null
+  created_at: string | null
 }
-type UIUpload = {
-  id: string; user_id: string; file_path: string; file_name: string; file_size: number | null;
-  mime_type: string | null; uploaded_at: string | null; public_url: string
+
+type UIAsset = {
+  id: string
+  owner_id: string
+  file_path: string
+  file_name: string
+  file_size: number | null
+  mime_type: string | null
+  uploaded_at: string | null
+  public_url: string
 }
-const toUI = (row: UploadedImageRow): UIUpload => {
-  const file_path = row.storage_path
-  const file_name = file_path.split("/").pop() || "file"
+
+const toUI = (row: AssetRow): UIAsset => {
+  const file_path = row.storage_path ?? row.title ?? ""
+  const file_name = (row.title && row.title.trim()) || file_path.split("/").pop() || "file"
   return {
-    id: row.id, user_id: row.user_id, file_path, file_name,
-    file_size: row.file_size_bytes ?? null, mime_type: row.file_type ?? null,
-    uploaded_at: row.created_at ?? null, public_url: row.image_url,
+    id: row.id,
+    owner_id: row.owner_id,
+    file_path,
+    file_name,
+    file_size: row.size_bytes ?? null,
+    mime_type: row.mime_type ?? null,
+    uploaded_at: row.created_at ?? null,
+    public_url: row.image_url ?? "",
   }
 }
+
+type ListingRow = {
+  id: string
+  source_id: string
+  seller_id: string
+  status: "listed" | "sold" | "inactive"
+  is_active: boolean
+  price_cents: number
+}
+
+/* ───────────────────── Component ───────────────────── */
 
 export default function Profile() {
   const supabase = createClientComponentClient()
   const { toast } = useToast()
-const [onboarding, setOnboarding] = useState(false)
+
+  const [onboarding, setOnboarding] = useState(false)
   const [uid, setUid] = useState<string | null>(null)
   const [loadingAuth, setLoadingAuth] = useState(true)
-  const [uploads, setUploads] = useState<UIUpload[]>([])
-  const [loadingUploads, setLoadingUploads] = useState(true)
+
+  // assets owned by the current user (canonical)
+  const [assets, setAssets] = useState<UIAsset[]>([])
+  const [loadingAssets, setLoadingAssets] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
   // seller/stripe status
@@ -52,16 +87,52 @@ const [onboarding, setOnboarding] = useState(false)
 
   // sell dialog
   const [sellOpen, setSellOpen] = useState(false)
-  const [selectedUpload, setSelectedUpload] = useState<UIUpload | null>(null)
+  const [selectedAsset, setSelectedAsset] = useState<UIAsset | null>(null)
   const [price, setPrice] = useState<string>("")
   const [creating, setCreating] = useState(false)
+
+  // listings map (source_id -> active listing)
+  const [listingBySource, setListingBySource] = useState<Record<string, ListingRow | undefined>>({})
+  const [canceling, setCanceling] = useState<string | null>(null)
 
   const PAGE_SIZE = 24
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
 
-  // ---- resolve session, then fetch
+  // helpers
+  const canSell = Boolean(stripeAccount && stripeVerified)
+  const totalMb = useMemo(() => assets.reduce((s, a) => s + (a.file_size ?? 0) / (1024 * 1024), 0), [assets])
+
+  /* ─────────────────── data helpers ─────────────────── */
+
+  async function fetchSellerListings(userId: string, assetIds: string[]) {
+    if (assetIds.length === 0) {
+      setListingBySource({})
+      return
+    }
+    const { data, error } = await supabase
+      .from("mkt_listings")
+      .select("id, source_id, seller_id, status, is_active, price_cents")
+      .eq("seller_id", userId)
+      .eq("source_type", "asset")
+      .in("source_id", assetIds)
+      .eq("status", "listed")
+      .eq("is_active", true)
+      .returns<ListingRow[]>()
+
+    if (error) {
+      console.error("fetch listings error:", error)
+      setListingBySource({})
+      return
+    }
+    const map: Record<string, ListingRow> = {}
+    for (const row of data ?? []) map[row.source_id] = row
+    setListingBySource(map)
+  }
+
+  /* ───────── resolve session, then initial fetch ───────── */
+
   useEffect(() => {
     let mounted = true
     ;(async () => {
@@ -73,9 +144,11 @@ const [onboarding, setOnboarding] = useState(false)
       if (!id) {
         setUid(null)
         setLoadingAuth(false)
-        setUploads([])
+        setAssets([])
         setHasMore(false)
-        setLoadingUploads(false)
+        setLoadingAssets(false)
+
+        // wait for signin
         const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
           if (s?.user?.id) {
             setUid(s.user.id)
@@ -92,31 +165,32 @@ const [onboarding, setOnboarding] = useState(false)
     })()
 
     async function fetchFirstPage(userId: string) {
-      setLoadingUploads(true)
+      setLoadingAssets(true)
       setLoadError(null)
+
       const { data, error } = await supabase
-        .from("uploaded_images")
-        .select("id,user_id,storage_path,image_url,file_size_bytes,file_type,created_at")
-        .eq("user_id", userId)
+        .from("user_assets")
+        .select("id, owner_id, title, image_url, storage_path, mime_type, size_bytes, created_at")
+        .eq("owner_id", userId)
         .order("created_at", { ascending: false })
         .range(0, PAGE_SIZE - 1)
-        .returns<UploadedImageRow[]>()
+        .returns<AssetRow[]>()
+
       if (error) {
         setLoadError(error.message)
-        setUploads([]); setHasMore(false)
+        setAssets([])
+        setHasMore(false)
       } else {
         const mapped = (data ?? []).map(toUI)
-        setUploads(mapped)
+        setAssets(mapped)
         setOffset(mapped.length)
         setHasMore((data?.length ?? 0) === PAGE_SIZE)
+        await fetchSellerListings(userId, mapped.map(a => a.id))
       }
-      setLoadingUploads(false)
+      setLoadingAssets(false)
     }
 
-
-
     async function fetchStripeStatus(userId: string) {
-      // read marketplace profile
       const { data, error } = await supabase
         .from("mkt_profiles")
         .select("stripe_verified, stripe_account_id")
@@ -131,9 +205,13 @@ const [onboarding, setOnboarding] = useState(false)
       }
     }
 
-    return () => { mounted = false }
+    return () => {
+      mounted = false
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  /* ─────────────────── sign-in helper ─────────────────── */
 
   const signInWithGoogle = async () => {
     const origin = window.location.origin
@@ -143,82 +221,111 @@ const [onboarding, setOnboarding] = useState(false)
     })
   }
 
+  /* ───────────────────── pagination ───────────────────── */
+
   const loadMore = useCallback(async () => {
     if (!uid || loadingMore) return
     setLoadingMore(true)
+
     const from = offset, to = offset + PAGE_SIZE - 1
     const { data, error } = await supabase
-      .from("uploaded_images")
-      .select("id,user_id,storage_path,image_url,file_size_bytes,file_type,created_at")
-      .eq("user_id", uid)
+      .from("user_assets")
+      .select("id, owner_id, title, image_url, storage_path, mime_type, size_bytes, created_at")
+      .eq("owner_id", uid)
       .order("created_at", { ascending: false })
       .range(from, to)
-      .returns<UploadedImageRow[]>()
+      .returns<AssetRow[]>()
+
     if (!error) {
       const mapped = (data ?? []).map(toUI)
-      setUploads(prev => [...prev, ...mapped])
+      setAssets(prev => {
+        const next = [...prev, ...mapped]
+        fetchSellerListings(uid, next.map(a => a.id))
+        return next
+      })
       setOffset(prev => prev + mapped.length)
       setHasMore(mapped.length === PAGE_SIZE)
     }
     setLoadingMore(false)
   }, [uid, offset, supabase, loadingMore])
 
-  // realtime: new uploads
+  /* ─────────── realtime: new assets / transfers ───────────
+     - INSERT: new asset created (via upload mirror)
+     - UPDATE: owner_id becomes current user (purchases)
+  */
   useEffect(() => {
     if (!uid) return
     const ch = supabase
-      .channel("uploads-feed")
-      .on("postgres_changes",
-        { event: "INSERT", schema: "public", table: "uploaded_images", filter: `user_id=eq.${uid}` },
-        (payload) => setUploads(prev => [toUI(payload.new as UploadedImageRow), ...prev]),
+      .channel("user-assets-feed")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "user_assets", filter: `owner_id=eq.${uid}` },
+        (payload) => {
+          const ui = toUI(payload.new as AssetRow)
+          setAssets(prev => {
+            const next = [ui, ...prev]
+            fetchSellerListings(uid, next.map(a => a.id))
+            return next
+          })
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "user_assets", filter: `owner_id=eq.${uid}` },
+        (payload) => {
+          const ui = toUI(payload.new as AssetRow)
+          setAssets(prev => {
+            // replace if already present, or prepend if newly acquired
+            const idx = prev.findIndex(a => a.id === ui.id)
+            const next = idx >= 0 ? [...prev.slice(0, idx), ui, ...prev.slice(idx + 1)] : [ui, ...prev]
+            fetchSellerListings(uid, next.map(a => a.id))
+            return next
+          })
+        }
       )
       .subscribe()
     return () => { supabase.removeChannel(ch) }
   }, [supabase, uid])
 
-  const { tokens, loading: nftLoading } = useOwnedCardify(FACTORY)
-  const totalMb = useMemo(() => uploads.reduce((s, u) => s + ((u.file_size ?? 0) / (1024 * 1024)), 0), [uploads])
+  /* ───────────────────── sell flow ───────────────────── */
 
-  // ───────────── sell flow ─────────────
-  const openSell = (u: UIUpload) => {
-    setSelectedUpload(u)
+  const openSell = (a: UIAsset) => {
+    setSelectedAsset(a)
     setPrice("")
     setSellOpen(true)
   }
 
   const createListing = async () => {
-    if (!uid || !selectedUpload) return
+    if (!uid || !selectedAsset) return
     const priceNum = Number(price)
     if (!priceNum || isNaN(priceNum) || priceNum <= 0) {
       toast({ title: "Enter a valid price (USD)", variant: "destructive" })
       return
     }
-    if (!stripeVerified) {
+    if (!canSell) {
       toast({
         title: "Stripe account required",
         description: "Connect Stripe to list items for sale.",
         variant: "destructive",
       })
-      // optional redirect to your connect page
-      // window.location.href = "/connect-stripe"
       return
     }
 
     setCreating(true)
-    // Insert into marketplace listings; RLS should enforce seller_id + stripe_verified
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from("mkt_listings")
       .insert({
-        title: selectedUpload.file_name,
-        image_url: selectedUpload.public_url,
-        storage_path: selectedUpload.file_path,
+        title: selectedAsset.file_name,
+        image_url: selectedAsset.public_url, // denormalized for browse
         price_cents: Math.round(priceNum * 100),
-        seller_id: uid,
+        seller_id: uid,              // must equal auth.uid()
         status: "listed",
         is_active: true,
-        source_type: "uploaded_image",
-        source_id: selectedUpload.id,
+        source_type: "asset",        // ⚠️ canonical
+        source_id: selectedAsset.id, // user_assets.id
       })
+      .select("id, source_id, seller_id, status, is_active, price_cents")
+      .returns<ListingRow[]>()
 
     setCreating(false)
     if (error) {
@@ -226,29 +333,37 @@ const [onboarding, setOnboarding] = useState(false)
       return
     }
 
-    toast({ title: "Listed for sale", description: selectedUpload.file_name })
+    const row = data?.[0]
+    if (row) setListingBySource(prev => ({ ...prev, [row.source_id]: row }))
+
+    toast({ title: "Listed for sale", description: selectedAsset.file_name })
     setSellOpen(false)
-    setSelectedUpload(null)
+    setSelectedAsset(null)
   }
 
-const connectStripe = useCallback(async () => {
-  try {
-    setOnboarding(true)
-    const res = await fetch('/api/stripe/onboard', { method: 'POST' })
-    const json = await res.json()
-    if (!res.ok || !json?.url) {
-      toast({
-        title: 'Stripe onboarding failed',
-        description: json?.error || 'Try again.',
-        variant: 'destructive',
-      })
+  const cancelListing = async (listing: ListingRow) => {
+    if (!uid) return
+    setCanceling(listing.id)
+    const { error } = await supabase
+      .from("mkt_listings")
+      .update({ status: "inactive", is_active: false })
+      .eq("id", listing.id)
+    setCanceling(null)
+
+    if (error) {
+      toast({ title: "Cancel failed", description: error.message, variant: "destructive" })
       return
     }
-    window.location.href = json.url
-  } finally {
-    setOnboarding(false)
+
+    setListingBySource(prev => {
+      const next = { ...prev }
+      delete next[listing.source_id]
+      return next
+    })
+    toast({ title: "Listing canceled" })
   }
-}, [toast])
+
+  /* ───────────────────── UI ───────────────────── */
 
   return (
     <div className="min-h-screen bg-cyber-black relative overflow-hidden font-mono">
@@ -264,31 +379,41 @@ const connectStripe = useCallback(async () => {
           </div>
           <div className="flex items-center gap-3">
             {!uid && !loadingAuth ? (
-              <Button className="cyber-button" onClick={signInWithGoogle}>Sign in with Google</Button>
+              <Button className="cyber-button" onClick={signInWithGoogle}>
+                Sign in with Google
+              </Button>
             ) : (
-              <Link href="/upload"><Button className="cyber-button">Create New Card</Button></Link>
+              <Link href="/upload">
+                <Button className="cyber-button">Create New Card</Button>
+              </Link>
             )}
           </div>
         </div>
 
-        {/* Uploads */}
+        {/* Assets (canonical) */}
         <section className="mb-14">
           <div className="flex items-end justify-between mb-4">
             <h2 className="text-2xl font-bold text-white tracking-wider">Uploads</h2>
             <div className="text-xs text-gray-400">
-              {uploads.length > 0 && <span>{uploads.length} file{uploads.length > 1 ? "s" : ""} • {totalMb.toFixed(2)} MB total</span>}
+              {assets.length > 0 && (
+                <span>
+                  {assets.length} file{assets.length > 1 ? "s" : ""} • {totalMb.toFixed(2)} MB total
+                </span>
+              )}
             </div>
           </div>
 
-          {loadingUploads ? (
+          {loadingAssets ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-              {Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="w-full h-64 rounded border border-cyber-cyan/20" />)}
+              {Array.from({ length: 6 }).map((_, i) => (
+                <Skeleton key={i} className="w-full h-64 rounded border border-cyber-cyan/20" />
+              ))}
             </div>
           ) : !uid ? (
             <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
               <CardContent className="p-6 text-center text-gray-400">Sign in to view your uploads.</CardContent>
             </Card>
-          ) : uploads.length === 0 ? (
+          ) : assets.length === 0 ? (
             <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
               <CardContent className="p-6 text-center text-gray-400">
                 {loadError ? (
@@ -296,8 +421,12 @@ const connectStripe = useCallback(async () => {
                 ) : (
                   <>
                     No uploads found for this account.
-                    <div className="text-xs text-gray-500 mt-2">Active user id: <span className="text-cyber-cyan">{uid ?? "—"}</span></div>
-                    <Link href="/upload" className="ml-2 text-cyber-cyan hover:text-cyber-pink underline">Upload artwork</Link>
+                    <div className="text-xs text-gray-500 mt-2">
+                      Active user id: <span className="text-cyber-cyan">{uid ?? "—"}</span>
+                    </div>
+                    <Link href="/upload" className="ml-2 text-cyber-cyan hover:text-cyber-pink underline">
+                      Upload artwork
+                    </Link>
                   </>
                 )}
               </CardContent>
@@ -305,46 +434,90 @@ const connectStripe = useCallback(async () => {
           ) : (
             <>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-                {uploads.map(u => (
-                  <Card key={u.id} className="bg-cyber-dark/60 border border-cyber-cyan/30 hover:border-cyber-cyan/60 transition-colors overflow-hidden">
-                    <CardContent className="p-0">
-                      <div className="relative">
-                        <Image
-                          src={u.public_url || "/placeholder.svg"}
-                          alt={u.file_name}
-                          width={800} height={600}
-                          className="w-full h-64 object-cover"
-                          onError={(e) => { (e.currentTarget as HTMLImageElement).src = "/placeholder.svg" }}
-                        />
-                        <Badge className="absolute top-3 left-3 bg-cyber-cyan/20 border border-cyber-cyan/40 text-cyber-cyan">Uploaded</Badge>
-                        {u.mime_type && (
-                          <Badge className="absolute top-3 right-3 bg-cyber-pink/20 border border-cyber-pink/40 text-cyber-pink">
-                            {u.mime_type.replace("image/", "").toUpperCase()}
+                {assets.map((a) => {
+                  const existing = listingBySource[a.id]
+                  const listed = !!existing && existing.is_active && existing.status === "listed"
+                  return (
+                    <Card
+                      key={a.id}
+                      className="bg-cyber-dark/60 border border-cyber-cyan/30 hover:border-cyber-cyan/60 transition-colors overflow-hidden"
+                    >
+                      <CardContent className="p-0">
+                        <div className="relative">
+                          <Image
+                            src={a.public_url || "/placeholder.svg"}
+                            alt={a.file_name}
+                            width={800}
+                            height={600}
+                            className="w-full h-64 object-cover"
+                            onError={(e) => { (e.currentTarget as HTMLImageElement).src = "/placeholder.svg" }}
+                          />
+                          <Badge className="absolute top-3 left-3 bg-cyber-cyan/20 border border-cyber-cyan/40 text-cyber-cyan">
+                            Uploaded
                           </Badge>
-                        )}
-                      </div>
-                      <div className="p-4 space-y-2">
-                        <div className="flex items-center justify-between gap-2">
-                          <h3 className="text-white font-bold truncate" title={u.file_name}>{u.file_name}</h3>
-                          <span className="text-xs text-gray-400">{(u.file_size ? u.file_size / (1024 * 1024) : 0).toFixed(2)} MB</span>
+                          {listed && (
+                            <Badge className="absolute top-3 left-28 bg-green-500/15 border border-green-500/30 text-green-400">
+                              Listed
+                            </Badge>
+                          )}
+                          {a.mime_type && (
+                            <Badge className="absolute top-3 right-3 bg-cyber-pink/20 border border-cyber-pink/40 text-cyber-pink">
+                              {a.mime_type.replace("image/", "").toUpperCase()}
+                            </Badge>
+                          )}
                         </div>
-                        <div className="text-xs text-gray-500">{u.uploaded_at ? new Date(u.uploaded_at).toLocaleString() : ""}</div>
-                        <div className="flex gap-2 pt-2">
-                          {/* REPLACED: Use in Order → Sell */}
-                          <Button className="cyber-button" size="sm" onClick={() => openSell(u)}>
-                            Sell
-                          </Button>
-                          <a href={u.public_url} target="_blank" rel="noopener noreferrer">
-                            <Button variant="outline" size="sm" className="border-cyber-cyan/40 text-cyber-cyan">
-                              Open
-                            </Button>
-                          </a>
+                        <div className="p-4 space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <h3 className="text-white font-bold truncate" title={a.file_name}>
+                              {a.file_name}
+                            </h3>
+                            <span className="text-xs text-gray-400">
+                              {(a.file_size ? a.file_size / (1024 * 1024) : 0).toFixed(2)} MB
+                            </span>
+                          </div>
+                          <div className="text-xs text-gray-500">
+                            {a.uploaded_at ? new Date(a.uploaded_at).toLocaleString() : ""}
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2 pt-2">
+                            {listed ? (
+                              <>
+                                <Badge className="bg-green-500/15 border border-green-500/30 text-green-400">
+                                  ${((existing!.price_cents ?? 0) / 100).toFixed(2)}
+                                </Badge>
+                                <Button
+                                  variant="destructive"
+                                  size="sm"
+                                  onClick={() => cancelListing(existing!)}
+                                  disabled={canceling === existing!.id}
+                                >
+                                  {canceling === existing!.id ? "Canceling…" : "Cancel listing"}
+                                </Button>
+                                <a href={a.public_url} target="_blank" rel="noopener noreferrer">
+                                  <Button variant="outline" size="sm" className="border-cyber-cyan/40 text-cyber-cyan">
+                                    Open
+                                  </Button>
+                                </a>
+                              </>
+                            ) : (
+                              <>
+                                <Button className="cyber-button" size="sm" onClick={() => openSell(a)}>
+                                  Sell
+                                </Button>
+                                <a href={a.public_url} target="_blank" rel="noopener noreferrer">
+                                  <Button variant="outline" size="sm" className="border-cyber-cyan/40 text-cyber-cyan">
+                                    Open
+                                  </Button>
+                                </a>
+                              </>
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    </CardContent>
-                  </Card>
-                ))}
+                      </CardContent>
+                    </Card>
+                  )
+                })}
               </div>
+
               {hasMore && (
                 <div className="flex justify-center mt-6">
                   <Button onClick={loadMore} disabled={loadingMore} className="cyber-button">
@@ -360,22 +533,28 @@ const connectStripe = useCallback(async () => {
         <section>
           <div className="mb-4 flex items-center justify-between">
             <h2 className="text-2xl font-bold text-white tracking-wider">On-Chain Cardify NFTs</h2>
-            <WalletButton />
+          <WalletButton />
           </div>
           {nftLoading ? (
             <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
-              <CardContent className="p-6 text-gray-400">Scanning wallet on Base-Sepolia…</CardContent>
-            </Card>
-          ) : tokens.length === 0 ? (
-            <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
-              <CardContent className="p-6 text-gray-400">Connect your wallet to see your Cardify NFTs.</CardContent>
+              <CardContent className="p-6 text-gray-400">Scanning wallet…</CardContent>
             </Card>
           ) : (
-            <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-6">
-              {tokens.map(([collection, id]) => (
-                <NFTCard key={`${collection}-${id}`} collection={collection as `0x${string}`} id={id} />
-              ))}
-            </div>
+            <>
+              {useMemo(() => tokens, [tokens]).length === 0 ? (
+                <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
+                  <CardContent className="p-6 text-gray-400">
+                    Connect your wallet to see your Cardify NFTs.
+                  </CardContent>
+                </Card>
+              ) : (
+                <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-6">
+                  {tokens.map(([collection, id]) => (
+                    <NFTCard key={`${collection}-${id}`} collection={collection as `0x${string}`} id={id} />
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </section>
       </div>
@@ -387,11 +566,11 @@ const connectStripe = useCallback(async () => {
             <DialogTitle>List for Sale</DialogTitle>
           </DialogHeader>
           <div className="space-y-4">
-            <div className="text-sm text-gray-400 break-words">
-              {selectedUpload?.file_name}
-            </div>
+            <div className="text-sm text-gray-400 break-words">{selectedAsset?.file_name}</div>
             <div>
-              <label htmlFor="sell-price" className="block text-sm font-medium">Price (USD)</label>
+              <label htmlFor="sell-price" className="block text-sm font-medium">
+                Price (USD)
+              </label>
               <Input
                 id="sell-price"
                 type="number"
@@ -401,29 +580,53 @@ const connectStripe = useCallback(async () => {
                 onChange={(e) => setPrice(e.target.value)}
                 placeholder="e.g. 19.99"
               />
-              {stripeVerified === false && (
+              {!canSell && (
                 <div className="mt-2 text-xs text-cyber-orange">
                   Stripe not connected. Connect your account to list items.
                 </div>
               )}
             </div>
           </div>
-<DialogFooter className="pt-2">
-  <Button variant="outline" onClick={() => setSellOpen(false)}>Cancel</Button>
+          <DialogFooter className="pt-2">
+            <Button variant="outline" onClick={() => setSellOpen(false)}>
+              Close
+            </Button>
 
-  {stripeVerified ? (
-    <Button onClick={createListing} disabled={creating} className="cyber-button">
-      {creating ? "Listing…" : "List"}
-    </Button>
-  ) : (
-    <Button onClick={connectStripe} disabled={onboarding} className="cyber-button">
-      {onboarding ? "Opening…" : "Connect Stripe"}
-    </Button>
-  )}
-</DialogFooter>
-
+            {canSell ? (
+              <Button onClick={createListing} disabled={creating} className="cyber-button">
+                {creating ? "Listing…" : "List"}
+              </Button>
+            ) : (
+              <Button
+                onClick={async () => {
+                  try {
+                    setOnboarding(true)
+                    const res = await fetch("/api/stripe/onboard", { method: "POST" })
+                    const json = await res.json()
+                    if (!res.ok || (!json?.url && !json?.dashboardUrl)) {
+                      toast({
+                        title: "Stripe onboarding failed",
+                        description: json?.error || "Try again.",
+                        variant: "destructive",
+                      })
+                      return
+                    }
+                    window.location.href = json.url ?? json.dashboardUrl
+                  } finally {
+                    setOnboarding(false)
+                  }
+                }}
+                disabled={onboarding}
+                className="cyber-button"
+              >
+                {onboarding ? "Opening…" : "Connect Stripe"}
+              </Button>
+            )}
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>
   )
 }
+
+ 

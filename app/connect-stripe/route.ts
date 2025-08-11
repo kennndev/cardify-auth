@@ -1,4 +1,4 @@
-import { stripe } from '@/lib/stripe'
+import { getStripeServer} from '@/lib/stripe'
 import { NextResponse } from 'next/server'
 import { createRouteHandlerClient } from '@supabase/auth-helpers-nextjs'
 import { cookies } from 'next/headers'
@@ -14,6 +14,8 @@ export async function GET() {
   }
 
   const userId = user.id
+      const stripe = getStripeServer('market'); 
+  
 
   // Check if Stripe already connected
   const { data: profile } = await supabase
