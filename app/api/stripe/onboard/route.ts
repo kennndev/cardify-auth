@@ -20,7 +20,7 @@ export async function POST() {
     .eq('id', user.id)
     .maybeSingle()
 
-  const origin = (process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000').replace(/\/$/, '')
+  const origin = (process.env.NEXT_PUBLIC_SITE_URL || 'https://cardify-auth.vercel.app').replace(/\/$/, '')
 
   let accountId = profile?.stripe_account_id ?? null
 
