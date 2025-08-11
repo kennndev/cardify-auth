@@ -38,7 +38,7 @@ export async function GET() {
       account: profile.stripe_account_id,
       type: "account_onboarding",
       refresh_url: process.env.NEXT_PUBLIC_STRIPE_REFRESH_URL || "http://localhost:3000/reauth",
-      return_url: process.env.NEXT_PUBLIC_STRIPE_RETURN_URL || "http://localhost:3000/profile",
+      return_url: process.env.NEXT_PUBLIC_STRIPE_RETURN_URL || "https://cardify-auth.vercel.app/profile",
     })
     return NextResponse.json({
       connected: true,
