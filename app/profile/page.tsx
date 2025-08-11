@@ -1,6 +1,8 @@
 // app/profile/page.tsx
 "use client"
 
+export const dynamic = "force-dynamic"   // avoid prerendering this auth-heavy client page
+
 import { useEffect, useMemo, useState, useCallback } from "react"
 import Image from "next/image"
 import Link from "next/link"
@@ -18,10 +20,8 @@ import { WalletButton } from "@/components/WalletConnect"
 
 const FACTORY = process.env.NEXT_PUBLIC_FACTORY_ADDRESS as `0x${string}`
 
-/* ───────────────────── Types ───────────────────── */
-
 type AssetRow = {
-  id: string               // user_assets.id  (canonical id used by listings)
+  id: string
   owner_id: string
   title: string | null
   image_url: string | null
@@ -66,8 +66,6 @@ type ListingRow = {
   price_cents: number
 }
 
-/* ───────────────────── Component ───────────────────── */
-
 export default function Profile() {
   const supabase = createClientComponentClient()
   const { toast } = useToast()
@@ -76,22 +74,18 @@ export default function Profile() {
   const [uid, setUid] = useState<string | null>(null)
   const [loadingAuth, setLoadingAuth] = useState(true)
 
-  // assets owned by the current user (canonical)
   const [assets, setAssets] = useState<UIAsset[]>([])
   const [loadingAssets, setLoadingAssets] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
-  // seller/stripe status
   const [stripeVerified, setStripeVerified] = useState<boolean | null>(null)
   const [stripeAccount, setStripeAccount] = useState<string | null>(null)
 
-  // sell dialog
   const [sellOpen, setSellOpen] = useState(false)
   const [selectedAsset, setSelectedAsset] = useState<UIAsset | null>(null)
   const [price, setPrice] = useState<string>("")
   const [creating, setCreating] = useState(false)
 
-  // listings map (source_id -> active listing)
   const [listingBySource, setListingBySource] = useState<Record<string, ListingRow | undefined>>({})
   const [canceling, setCanceling] = useState<string | null>(null)
 
@@ -100,17 +94,11 @@ export default function Profile() {
   const [hasMore, setHasMore] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
 
-  // helpers
   const canSell = Boolean(stripeAccount && stripeVerified)
   const totalMb = useMemo(() => assets.reduce((s, a) => s + (a.file_size ?? 0) / (1024 * 1024), 0), [assets])
 
-  /* ─────────────────── data helpers ─────────────────── */
-
   async function fetchSellerListings(userId: string, assetIds: string[]) {
-    if (assetIds.length === 0) {
-      setListingBySource({})
-      return
-    }
+    if (assetIds.length === 0) { setListingBySource({}); return }
     const { data, error } = await supabase
       .from("mkt_listings")
       .select("id, source_id, seller_id, status, is_active, price_cents")
@@ -120,18 +108,11 @@ export default function Profile() {
       .eq("status", "listed")
       .eq("is_active", true)
       .returns<ListingRow[]>()
-
-    if (error) {
-      console.error("fetch listings error:", error)
-      setListingBySource({})
-      return
-    }
+    if (error) { console.error(error); setListingBySource({}); return }
     const map: Record<string, ListingRow> = {}
     for (const row of data ?? []) map[row.source_id] = row
     setListingBySource(map)
   }
-
-  /* ───────── resolve session, then initial fetch ───────── */
 
   useEffect(() => {
     let mounted = true
@@ -144,11 +125,7 @@ export default function Profile() {
       if (!id) {
         setUid(null)
         setLoadingAuth(false)
-        setAssets([])
-        setHasMore(false)
-        setLoadingAssets(false)
-
-        // wait for signin
+        setAssets([]); setHasMore(false); setLoadingAssets(false)
         const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
           if (s?.user?.id) {
             setUid(s.user.id)
@@ -165,9 +142,7 @@ export default function Profile() {
     })()
 
     async function fetchFirstPage(userId: string) {
-      setLoadingAssets(true)
-      setLoadError(null)
-
+      setLoadingAssets(true); setLoadError(null)
       const { data, error } = await supabase
         .from("user_assets")
         .select("id, owner_id, title, image_url, storage_path, mime_type, size_bytes, created_at")
@@ -175,12 +150,8 @@ export default function Profile() {
         .order("created_at", { ascending: false })
         .range(0, PAGE_SIZE - 1)
         .returns<AssetRow[]>()
-
-      if (error) {
-        setLoadError(error.message)
-        setAssets([])
-        setHasMore(false)
-      } else {
+      if (error) { setLoadError(error.message); setAssets([]); setHasMore(false) }
+      else {
         const mapped = (data ?? []).map(toUI)
         setAssets(mapped)
         setOffset(mapped.length)
@@ -196,22 +167,13 @@ export default function Profile() {
         .select("stripe_verified, stripe_account_id")
         .eq("id", userId)
         .single()
-      if (!error && data) {
-        setStripeVerified(!!data.stripe_verified)
-        setStripeAccount(data.stripe_account_id ?? null)
-      } else {
-        setStripeVerified(false)
-        setStripeAccount(null)
-      }
+      if (!error && data) { setStripeVerified(!!data.stripe_verified); setStripeAccount(data.stripe_account_id ?? null) }
+      else { setStripeVerified(false); setStripeAccount(null) }
     }
 
-    return () => {
-      mounted = false
-    }
+    return () => { mounted = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  /* ─────────────────── sign-in helper ─────────────────── */
 
   const signInWithGoogle = async () => {
     const origin = window.location.origin
@@ -221,12 +183,9 @@ export default function Profile() {
     })
   }
 
-  /* ───────────────────── pagination ───────────────────── */
-
   const loadMore = useCallback(async () => {
     if (!uid || loadingMore) return
     setLoadingMore(true)
-
     const from = offset, to = offset + PAGE_SIZE - 1
     const { data, error } = await supabase
       .from("user_assets")
@@ -235,7 +194,6 @@ export default function Profile() {
       .order("created_at", { ascending: false })
       .range(from, to)
       .returns<AssetRow[]>()
-
     if (!error) {
       const mapped = (data ?? []).map(toUI)
       setAssets(prev => {
@@ -249,10 +207,6 @@ export default function Profile() {
     setLoadingMore(false)
   }, [uid, offset, supabase, loadingMore])
 
-  /* ─────────── realtime: new assets / transfers ───────────
-     - INSERT: new asset created (via upload mirror)
-     - UPDATE: owner_id becomes current user (purchases)
-  */
   useEffect(() => {
     if (!uid) return
     const ch = supabase
@@ -262,11 +216,7 @@ export default function Profile() {
         { event: "INSERT", schema: "public", table: "user_assets", filter: `owner_id=eq.${uid}` },
         (payload) => {
           const ui = toUI(payload.new as AssetRow)
-          setAssets(prev => {
-            const next = [ui, ...prev]
-            fetchSellerListings(uid, next.map(a => a.id))
-            return next
-          })
+          setAssets(prev => { const next = [ui, ...prev]; fetchSellerListings(uid, next.map(a => a.id)); return next })
         }
       )
       .on(
@@ -275,7 +225,6 @@ export default function Profile() {
         (payload) => {
           const ui = toUI(payload.new as AssetRow)
           setAssets(prev => {
-            // replace if already present, or prepend if newly acquired
             const idx = prev.findIndex(a => a.id === ui.id)
             const next = idx >= 0 ? [...prev.slice(0, idx), ui, ...prev.slice(idx + 1)] : [ui, ...prev]
             fetchSellerListings(uid, next.map(a => a.id))
@@ -287,83 +236,54 @@ export default function Profile() {
     return () => { supabase.removeChannel(ch) }
   }, [supabase, uid])
 
-  /* ───────────────────── sell flow ───────────────────── */
+  // ✅ declare variables explicitly to avoid “not defined” during build
+  const owned = useOwnedCardify(FACTORY)
+  const nftLoading = owned.loading
+  const tokens = owned.tokens ?? []
 
-  const openSell = (a: UIAsset) => {
-    setSelectedAsset(a)
-    setPrice("")
-    setSellOpen(true)
-  }
+  const openSell = (a: UIAsset) => { setSelectedAsset(a); setPrice(""); setSellOpen(true) }
 
   const createListing = async () => {
     if (!uid || !selectedAsset) return
     const priceNum = Number(price)
     if (!priceNum || isNaN(priceNum) || priceNum <= 0) {
-      toast({ title: "Enter a valid price (USD)", variant: "destructive" })
-      return
+      toast({ title: "Enter a valid price (USD)", variant: "destructive" }); return
     }
     if (!canSell) {
-      toast({
-        title: "Stripe account required",
-        description: "Connect Stripe to list items for sale.",
-        variant: "destructive",
-      })
+      toast({ title: "Stripe account required", description: "Connect Stripe to list items for sale.", variant: "destructive" })
       return
     }
-
     setCreating(true)
     const { data, error } = await supabase
       .from("mkt_listings")
       .insert({
         title: selectedAsset.file_name,
-        image_url: selectedAsset.public_url, // denormalized for browse
+        image_url: selectedAsset.public_url,
         price_cents: Math.round(priceNum * 100),
-        seller_id: uid,              // must equal auth.uid()
+        seller_id: uid,
         status: "listed",
         is_active: true,
-        source_type: "asset",        // ⚠️ canonical
-        source_id: selectedAsset.id, // user_assets.id
+        source_type: "asset",
+        source_id: selectedAsset.id,
       })
       .select("id, source_id, seller_id, status, is_active, price_cents")
       .returns<ListingRow[]>()
-
     setCreating(false)
-    if (error) {
-      toast({ title: "Listing failed", description: error.message, variant: "destructive" })
-      return
-    }
-
-    const row = data?.[0]
-    if (row) setListingBySource(prev => ({ ...prev, [row.source_id]: row }))
-
+    if (error) { toast({ title: "Listing failed", description: error.message, variant: "destructive" }); return }
+    const row = data?.[0]; if (row) setListingBySource(prev => ({ ...prev, [row.source_id]: row }))
     toast({ title: "Listed for sale", description: selectedAsset.file_name })
-    setSellOpen(false)
-    setSelectedAsset(null)
+    setSellOpen(false); setSelectedAsset(null)
   }
 
   const cancelListing = async (listing: ListingRow) => {
     if (!uid) return
     setCanceling(listing.id)
-    const { error } = await supabase
-      .from("mkt_listings")
-      .update({ status: "inactive", is_active: false })
-      .eq("id", listing.id)
+    const { error } = await supabase.from("mkt_listings").update({ status: "inactive", is_active: false }).eq("id", listing.id)
     setCanceling(null)
-
-    if (error) {
-      toast({ title: "Cancel failed", description: error.message, variant: "destructive" })
-      return
-    }
-
-    setListingBySource(prev => {
-      const next = { ...prev }
-      delete next[listing.source_id]
-      return next
-    })
+    if (error) { toast({ title: "Cancel failed", description: error.message, variant: "destructive" }); return }
+    setListingBySource(prev => { const next = { ...prev }; delete next[listing.source_id]; return next })
     toast({ title: "Listing canceled" })
   }
-
-  /* ───────────────────── UI ───────────────────── */
 
   return (
     <div className="min-h-screen bg-cyber-black relative overflow-hidden font-mono">
@@ -379,54 +299,37 @@ export default function Profile() {
           </div>
           <div className="flex items-center gap-3">
             {!uid && !loadingAuth ? (
-              <Button className="cyber-button" onClick={signInWithGoogle}>
-                Sign in with Google
-              </Button>
+              <Button className="cyber-button" onClick={signInWithGoogle}>Sign in with Google</Button>
             ) : (
-              <Link href="/upload">
-                <Button className="cyber-button">Create New Card</Button>
-              </Link>
+              <Link href="/upload"><Button className="cyber-button">Create New Card</Button></Link>
             )}
           </div>
         </div>
 
-        {/* Assets (canonical) */}
+        {/* Assets */}
         <section className="mb-14">
           <div className="flex items-end justify-between mb-4">
             <h2 className="text-2xl font-bold text-white tracking-wider">Uploads</h2>
             <div className="text-xs text-gray-400">
-              {assets.length > 0 && (
-                <span>
-                  {assets.length} file{assets.length > 1 ? "s" : ""} • {totalMb.toFixed(2)} MB total
-                </span>
-              )}
+              {assets.length > 0 && <span>{assets.length} file{assets.length > 1 ? "s" : ""} • {totalMb.toFixed(2)} MB total</span>}
             </div>
           </div>
 
           {loadingAssets ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
-              {Array.from({ length: 6 }).map((_, i) => (
-                <Skeleton key={i} className="w-full h-64 rounded border border-cyber-cyan/20" />
-              ))}
+              {Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="w-full h-64 rounded border border-cyber-cyan/20" />)}
             </div>
           ) : !uid ? (
-            <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
-              <CardContent className="p-6 text-center text-gray-400">Sign in to view your uploads.</CardContent>
-            </Card>
+            <Card className="bg-cyber-dark/60 border border-cyber-cyan/30"><CardContent className="p-6 text-center text-gray-400">Sign in to view your uploads.</CardContent></Card>
           ) : assets.length === 0 ? (
             <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
               <CardContent className="p-6 text-center text-gray-400">
                 {loadError ? (
                   <div className="text-cyber-orange">Failed to load uploads: {loadError}</div>
                 ) : (
-                  <>
-                    No uploads found for this account.
-                    <div className="text-xs text-gray-500 mt-2">
-                      Active user id: <span className="text-cyber-cyan">{uid ?? "—"}</span>
-                    </div>
-                    <Link href="/upload" className="ml-2 text-cyber-cyan hover:text-cyber-pink underline">
-                      Upload artwork
-                    </Link>
+                  <>No uploads found for this account.
+                    <div className="text-xs text-gray-500 mt-2">Active user id: <span className="text-cyber-cyan">{uid ?? "—"}</span></div>
+                    <Link href="/upload" className="ml-2 text-cyber-cyan hover:text-cyber-pink underline">Upload artwork</Link>
                   </>
                 )}
               </CardContent>
@@ -438,75 +341,37 @@ export default function Profile() {
                   const existing = listingBySource[a.id]
                   const listed = !!existing && existing.is_active && existing.status === "listed"
                   return (
-                    <Card
-                      key={a.id}
-                      className="bg-cyber-dark/60 border border-cyber-cyan/30 hover:border-cyber-cyan/60 transition-colors overflow-hidden"
-                    >
+                    <Card key={a.id} className="bg-cyber-dark/60 border border-cyber-cyan/30 hover:border-cyber-cyan/60 transition-colors overflow-hidden">
                       <CardContent className="p-0">
                         <div className="relative">
-                          <Image
-                            src={a.public_url || "/placeholder.svg"}
-                            alt={a.file_name}
-                            width={800}
-                            height={600}
-                            className="w-full h-64 object-cover"
-                            onError={(e) => { (e.currentTarget as HTMLImageElement).src = "/placeholder.svg" }}
-                          />
-                          <Badge className="absolute top-3 left-3 bg-cyber-cyan/20 border border-cyber-cyan/40 text-cyber-cyan">
-                            Uploaded
-                          </Badge>
-                          {listed && (
-                            <Badge className="absolute top-3 left-28 bg-green-500/15 border border-green-500/30 text-green-400">
-                              Listed
-                            </Badge>
-                          )}
-                          {a.mime_type && (
-                            <Badge className="absolute top-3 right-3 bg-cyber-pink/20 border border-cyber-pink/40 text-cyber-pink">
-                              {a.mime_type.replace("image/", "").toUpperCase()}
-                            </Badge>
-                          )}
+                          <Image src={a.public_url || "/placeholder.svg"} alt={a.file_name} width={800} height={600} className="w-full h-64 object-cover"
+                                 onError={(e) => { (e.currentTarget as HTMLImageElement).src = "/placeholder.svg" }} />
+                          <Badge className="absolute top-3 left-3 bg-cyber-cyan/20 border border-cyber-cyan/40 text-cyber-cyan">Uploaded</Badge>
+                          {listed && <Badge className="absolute top-3 left-28 bg-green-500/15 border border-green-500/30 text-green-400">Listed</Badge>}
+                          {a.mime_type && <Badge className="absolute top-3 right-3 bg-cyber-pink/20 border border-cyber-pink/40 text-cyber-pink">{a.mime_type.replace("image/","").toUpperCase()}</Badge>}
                         </div>
                         <div className="p-4 space-y-2">
                           <div className="flex items-center justify-between gap-2">
-                            <h3 className="text-white font-bold truncate" title={a.file_name}>
-                              {a.file_name}
-                            </h3>
-                            <span className="text-xs text-gray-400">
-                              {(a.file_size ? a.file_size / (1024 * 1024) : 0).toFixed(2)} MB
-                            </span>
+                            <h3 className="text-white font-bold truncate" title={a.file_name}>{a.file_name}</h3>
+                            <span className="text-xs text-gray-400">{(a.file_size ? a.file_size / (1024 * 1024) : 0).toFixed(2)} MB</span>
                           </div>
-                          <div className="text-xs text-gray-500">
-                            {a.uploaded_at ? new Date(a.uploaded_at).toLocaleString() : ""}
-                          </div>
+                          <div className="text-xs text-gray-500">{a.uploaded_at ? new Date(a.uploaded_at).toLocaleString() : ""}</div>
                           <div className="flex flex-wrap items-center gap-2 pt-2">
                             {listed ? (
                               <>
-                                <Badge className="bg-green-500/15 border border-green-500/30 text-green-400">
-                                  ${((existing!.price_cents ?? 0) / 100).toFixed(2)}
-                                </Badge>
-                                <Button
-                                  variant="destructive"
-                                  size="sm"
-                                  onClick={() => cancelListing(existing!)}
-                                  disabled={canceling === existing!.id}
-                                >
+                                <Badge className="bg-green-500/15 border border-green-500/30 text-green-400">${((existing!.price_cents ?? 0) / 100).toFixed(2)}</Badge>
+                                <Button variant="destructive" size="sm" onClick={() => cancelListing(existing!)} disabled={canceling === existing!.id}>
                                   {canceling === existing!.id ? "Canceling…" : "Cancel listing"}
                                 </Button>
                                 <a href={a.public_url} target="_blank" rel="noopener noreferrer">
-                                  <Button variant="outline" size="sm" className="border-cyber-cyan/40 text-cyber-cyan">
-                                    Open
-                                  </Button>
+                                  <Button variant="outline" size="sm" className="border-cyber-cyan/40 text-cyber-cyan">Open</Button>
                                 </a>
                               </>
                             ) : (
                               <>
-                                <Button className="cyber-button" size="sm" onClick={() => openSell(a)}>
-                                  Sell
-                                </Button>
+                                <Button className="cyber-button" size="sm" onClick={() => openSell(a)}>Sell</Button>
                                 <a href={a.public_url} target="_blank" rel="noopener noreferrer">
-                                  <Button variant="outline" size="sm" className="border-cyber-cyan/40 text-cyber-cyan">
-                                    Open
-                                  </Button>
+                                  <Button variant="outline" size="sm" className="border-cyber-cyan/40 text-cyber-cyan">Open</Button>
                                 </a>
                               </>
                             )}
@@ -517,7 +382,6 @@ export default function Profile() {
                   )
                 })}
               </div>
-
               {hasMore && (
                 <div className="flex justify-center mt-6">
                   <Button onClick={loadMore} disabled={loadingMore} className="cyber-button">
@@ -533,65 +397,41 @@ export default function Profile() {
         <section>
           <div className="mb-4 flex items-center justify-between">
             <h2 className="text-2xl font-bold text-white tracking-wider">On-Chain Cardify NFTs</h2>
-          <WalletButton />
+            <WalletButton />
           </div>
           {nftLoading ? (
             <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
               <CardContent className="p-6 text-gray-400">Scanning wallet…</CardContent>
             </Card>
+          ) : tokens.length === 0 ? (
+            <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
+              <CardContent className="p-6 text-gray-400">Connect your wallet to see your Cardify NFTs.</CardContent>
+            </Card>
           ) : (
-            <>
-              {useMemo(() => tokens, [tokens]).length === 0 ? (
-                <Card className="bg-cyber-dark/60 border border-cyber-cyan/30">
-                  <CardContent className="p-6 text-gray-400">
-                    Connect your wallet to see your Cardify NFTs.
-                  </CardContent>
-                </Card>
-              ) : (
-                <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-6">
-                  {tokens.map(([collection, id]) => (
-                    <NFTCard key={`${collection}-${id}`} collection={collection as `0x${string}`} id={id} />
-                  ))}
-                </div>
-              )}
-            </>
+            <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-6">
+              {tokens.map(([collection, id]) => (
+                <NFTCard key={`${collection}-${id}`} collection={collection as `0x${string}`} id={id} />
+              ))}
+            </div>
           )}
         </section>
       </div>
 
-      {/* Sell Dialog */}
+      {/* Sell dialog */}
       <Dialog open={sellOpen} onOpenChange={setSellOpen}>
         <DialogContent>
-          <DialogHeader>
-            <DialogTitle>List for Sale</DialogTitle>
-          </DialogHeader>
+          <DialogHeader><DialogTitle>List for Sale</DialogTitle></DialogHeader>
           <div className="space-y-4">
             <div className="text-sm text-gray-400 break-words">{selectedAsset?.file_name}</div>
             <div>
-              <label htmlFor="sell-price" className="block text-sm font-medium">
-                Price (USD)
-              </label>
-              <Input
-                id="sell-price"
-                type="number"
-                min={0}
-                step="0.01"
-                value={price}
-                onChange={(e) => setPrice(e.target.value)}
-                placeholder="e.g. 19.99"
-              />
-              {!canSell && (
-                <div className="mt-2 text-xs text-cyber-orange">
-                  Stripe not connected. Connect your account to list items.
-                </div>
-              )}
+              <label htmlFor="sell-price" className="block text-sm font-medium">Price (USD)</label>
+              <Input id="sell-price" type="number" min={0} step="0.01" value={price}
+                     onChange={(e) => setPrice(e.target.value)} placeholder="e.g. 19.99" />
+              {!canSell && <div className="mt-2 text-xs text-cyber-orange">Stripe not connected. Connect your account to list items.</div>}
             </div>
           </div>
           <DialogFooter className="pt-2">
-            <Button variant="outline" onClick={() => setSellOpen(false)}>
-              Close
-            </Button>
-
+            <Button variant="outline" onClick={() => setSellOpen(false)}>Close</Button>
             {canSell ? (
               <Button onClick={createListing} disabled={creating} className="cyber-button">
                 {creating ? "Listing…" : "List"}
@@ -604,17 +444,11 @@ export default function Profile() {
                     const res = await fetch("/api/stripe/onboard", { method: "POST" })
                     const json = await res.json()
                     if (!res.ok || (!json?.url && !json?.dashboardUrl)) {
-                      toast({
-                        title: "Stripe onboarding failed",
-                        description: json?.error || "Try again.",
-                        variant: "destructive",
-                      })
+                      toast({ title: "Stripe onboarding failed", description: json?.error || "Try again.", variant: "destructive" })
                       return
                     }
                     window.location.href = json.url ?? json.dashboardUrl
-                  } finally {
-                    setOnboarding(false)
-                  }
+                  } finally { setOnboarding(false) }
                 }}
                 disabled={onboarding}
                 className="cyber-button"
@@ -628,5 +462,3 @@ export default function Profile() {
     </div>
   )
 }
-
- 
