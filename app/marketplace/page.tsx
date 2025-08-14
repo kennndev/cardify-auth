@@ -6,7 +6,7 @@ import Image from 'next/image'
 import { useRouter } from 'next/navigation'
 import { createClientComponentClient } from '@supabase/auth-helpers-nextjs'
 import type { SupabaseClient } from '@supabase/supabase-js'
-import { Search } from 'lucide-react'
+import { Search, User as UserIcon } from "lucide-react"
 
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -99,25 +99,28 @@ function MarketplaceCard({
 
             <div className="flex items-center gap-2">
               {/* Seller avatar -> seller profile page */}
-              <Link
-                href={`/seller/${listing.seller_id}`}
-                title={seller?.display_name || 'View seller'}
-                className="relative grid place-items-center w-10 h-10 rounded-full overflow-hidden border-2 border-cyber-cyan hover:border-cyber-green transition-colors"
-              >
-                {seller?.avatar_url ? (
-                  <Image
-                    src={seller.avatar_url}
-                    alt={seller.display_name || 'Seller'}
-                    fill
-                    sizes="40px"
-                    className="object-cover"
-                  />
-                ) : (
-                  <span className="text-cyber-cyan text-sm font-bold">
-                    {initials(seller?.display_name)}
-                  </span>
-                )}
-              </Link>
+<Link
+  href={`/seller/${listing.seller_id}`}
+  title={seller?.display_name || 'View seller'}
+  className="relative grid place-items-center w-10 h-10 rounded-full overflow-hidden border-2 border-cyber-cyan hover:border-cyber-green transition-colors"
+>
+  {seller?.avatar_url ? (
+    <Image
+      src={seller.avatar_url}
+      alt={seller.display_name || 'Seller'}
+      fill
+      sizes="40px"
+      className="object-cover"
+    />
+  ) : (seller?.display_name && initials(seller.display_name) !== '?') ? (
+    <span className="text-cyber-cyan text-sm font-bold">
+      {initials(seller.display_name)}
+    </span>
+  ) : (
+    <UserIcon className="w-5 h-5 text-cyber-cyan" />
+  )}
+</Link>
+
 
               {/* Action button */}
               {isSeller ? (
