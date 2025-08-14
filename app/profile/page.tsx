@@ -1,4 +1,3 @@
-// app/profile/page.tsx
 "use client"
 
 export const dynamic = "force-dynamic"
@@ -12,7 +11,6 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
-import { Input } from "@/components/ui/input"
 import { useToast } from "@/hooks/use-toast"
 import { useOwnedCardify } from "@/hooks/useOwnedCardify"
 import NFTCard from "@/components/NFTCard"
@@ -82,7 +80,6 @@ export default function Profile() {
   const [stripeVerified, setStripeVerified] = useState<boolean | null>(null)
   const [stripeAccount, setStripeAccount] = useState<string | null>(null)
 
-  // SELL dialog (fixed $9.00)
   const [sellOpen, setSellOpen] = useState(false)
   const [selectedAsset, setSelectedAsset] = useState<UIAsset | null>(null)
   const FIXED_PRICE_USD = 9
@@ -129,84 +126,104 @@ export default function Profile() {
     setListingBySource(map)
   }
 
-  useEffect(() => {
-    let mounted = true
-    ;(async () => {
-      setLoadingAuth(true)
-      const {
-        data: { session },
-      } = await supabase.auth.getSession()
-      const id = session?.user?.id ?? null
-      if (!mounted) return
+useEffect(() => {
+  let mounted = true
 
-      if (!id) {
-        setUid(null)
-        setAvatarUrl(null)
-        setLoadingAuth(false)
-        setAssets([])
-        setHasMore(false)
-        setLoadingAssets(false)
-        const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => {
-          if (s?.user?.id) {
-            setUid(s.user.id)
-            setAvatarUrl(s.user.user_metadata?.avatar_url || null)
-            fetchFirstPage(s.user.id)
-            fetchStripeStatus(s.user.id)
-          }
-        })
-        return () => sub.subscription.unsubscribe()
-      }
+  ;(async () => {
+    setLoadingAuth(true)
 
+    const { data: { session } } = await supabase.auth.getSession()
+    const id = session?.user?.id ?? null
+    if (!mounted) return
+
+    if (!id) {
+      setUid(null)
+      setAvatarUrl(null)
+      setLoadingAuth(false)
+      setAssets([])
+      setHasMore(false)
+      setLoadingAssets(false)
+    } else {
       setUid(id)
-      setAvatarUrl(session?.user?.user_metadata?.avatar_url || null)
+
+      // Always load avatar from mkt_profiles only
+      const { data: prof } = await supabase
+        .from("mkt_profiles")
+        .select("avatar_url")
+        .eq("id", id)
+        .single()
+
+      setAvatarUrl(prof?.avatar_url ?? null)
+
       setLoadingAuth(false)
       await Promise.all([fetchFirstPage(id), fetchStripeStatus(id)])
-    })()
-
-    async function fetchFirstPage(userId: string) {
-      setLoadingAssets(true)
-      setLoadError(null)
-      const { data, error } = await supabase
-        .from("user_assets")
-        .select("id, owner_id, title, image_url, storage_path, mime_type, size_bytes, created_at")
-        .eq("owner_id", userId)
-        .order("created_at", { ascending: false })
-        .range(0, PAGE_SIZE - 1)
-        .returns<AssetRow[]>()
-      if (error) {
-        setLoadError(error.message)
-        setAssets([])
-        setHasMore(false)
-      } else {
-        const mapped = (data ?? []).map(toUI)
-        setAssets(mapped)
-        setOffset(mapped.length)
-        setHasMore((data?.length ?? 0) === PAGE_SIZE)
-        await fetchSellerListings(userId, mapped.map((a) => a.id))
-      }
-      setLoadingAssets(false)
     }
+  })()
 
-    async function fetchStripeStatus(userId: string) {
-      const { data, error } = await supabase
-        .from("mkt_profiles")
-        .select("stripe_verified, stripe_account_id")
-        .eq("id", userId)
-        .single()
-      if (!error && data) {
-        setStripeVerified(!!data.stripe_verified)
-        setStripeAccount(data.stripe_account_id ?? null)
-      } else {
-        setStripeVerified(false)
-        setStripeAccount(null)
-      }
-    }
+  // Subscribe once; always refresh from mkt_profiles on auth state change
+  const { data: sub } = supabase.auth.onAuthStateChange(async (_event, s) => {
+    const newId = s?.user?.id
+    if (!newId) return
+    setUid(newId)
 
-    return () => {
-      mounted = false
+    const { data: prof } = await supabase
+      .from("mkt_profiles")
+      .select("avatar_url")
+      .eq("id", newId)
+      .single()
+
+    setAvatarUrl(prof?.avatar_url ?? null)
+
+    fetchFirstPage(newId)
+    fetchStripeStatus(newId)
+  })
+
+  return () => {
+    mounted = false
+    sub?.subscription?.unsubscribe()
+  }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [])
+
+
+  async function fetchFirstPage(userId: string) {
+    setLoadingAssets(true)
+    setLoadError(null)
+    const { data, error } = await supabase
+      .from("user_assets")
+      .select("id, owner_id, title, image_url, storage_path, mime_type, size_bytes, created_at")
+      .eq("owner_id", userId)
+      .order("created_at", { ascending: false })
+      .range(0, PAGE_SIZE - 1)
+      .returns<AssetRow[]>()
+    if (error) {
+      setLoadError(error.message)
+      setAssets([])
+      setHasMore(false)
+    } else {
+      const mapped = (data ?? []).map(toUI)
+      setAssets(mapped)
+      setOffset(mapped.length)
+      setHasMore((data?.length ?? 0) === PAGE_SIZE)
+      await fetchSellerListings(userId, mapped.map((a) => a.id))
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+    setLoadingAssets(false)
+  }
+
+  async function fetchStripeStatus(userId: string) {
+    const { data, error } = await supabase
+      .from("mkt_profiles")
+      .select("stripe_verified, stripe_account_id")
+      .eq("id", userId)
+      .single()
+    if (!error && data) {
+      setStripeVerified(!!data.stripe_verified)
+      setStripeAccount(data.stripe_account_id ?? null)
+    } else {
+      setStripeVerified(false)
+      setStripeAccount(null)
+    }
+  }
 
   const signInWithGoogle = async () => {
     const origin = window.location.origin
@@ -219,8 +236,7 @@ export default function Profile() {
   const loadMore = useCallback(async () => {
     if (!uid || loadingMore) return
     setLoadingMore(true)
-    const from = offset,
-      to = offset + PAGE_SIZE - 1
+    const from = offset, to = offset + PAGE_SIZE - 1
     const { data, error } = await supabase
       .from("user_assets")
       .select("id, owner_id, title, image_url, storage_path, mime_type, size_bytes, created_at")
@@ -276,12 +292,10 @@ export default function Profile() {
     }
   }, [supabase, uid])
 
-  // On-chain NFTs
   const owned = useOwnedCardify(FACTORY)
   const nftLoading = owned.loading
   const tokens = owned.tokens ?? []
 
-  // SELL: fixed $9
   const openSell = (a: UIAsset) => {
     setSelectedAsset(a)
     setSellOpen(true)
@@ -303,7 +317,7 @@ export default function Profile() {
       .insert({
         title: selectedAsset.file_name,
         image_url: selectedAsset.public_url,
-        price_cents: FIXED_PRICE_USD * 100, // $9
+        price_cents: FIXED_PRICE_USD * 100,
         seller_id: uid,
         status: "listed",
         is_active: true,
@@ -327,10 +341,7 @@ export default function Profile() {
   const cancelListing = async (listing: ListingRow) => {
     if (!uid) return
     setCanceling(listing.id)
-    const { error } = await supabase
-      .from("mkt_listings")
-      .update({ status: "inactive", is_active: false })
-      .eq("id", listing.id)
+    const { error } = await supabase.from("mkt_listings").update({ status: "inactive", is_active: false }).eq("id", listing.id)
     setCanceling(null)
     if (error) {
       toast({ title: "Cancel failed", description: error.message, variant: "destructive" })
@@ -350,10 +361,11 @@ export default function Profile() {
       <div className="fixed inset-0 scanlines opacity-20 pointer-events-none" />
 
       <div className="px-6 py-8 pt-24 relative max-w-7xl mx-auto">
-        {/* Minimal round avatar */}
+        {/* Avatar */}
         <div className="mb-8">
           {uid && (
             <AvatarUploader
+              key={uid}             // remount on account switch
               uid={uid}
               initialUrl={avatarUrl}
               onUpdated={(url) => setAvatarUrl(url)}
@@ -553,13 +565,9 @@ export default function Profile() {
           </DialogHeader>
           <div className="space-y-4">
             <div className="text-sm text-gray-400 break-words">{selectedAsset?.file_name}</div>
-            <div>
-                         {!canSell && (
-                <div className="mt-2 text-xs text-cyber-orange">
-                  Stripe not connected. Connect your account to list items.
-                </div>
-              )}
-            </div>
+            {!canSell && (
+              <div className="mt-2 text-xs text-cyber-orange">Stripe not connected. Connect your account to list items.</div>
+            )}
           </div>
           <DialogFooter className="pt-2">
             <Button variant="outline" onClick={() => setSellOpen(false)}>
