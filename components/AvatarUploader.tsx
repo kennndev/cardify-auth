@@ -1,6 +1,6 @@
 "use client"
 
-import { useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import Image from "next/image"
 import { createClientComponentClient } from "@supabase/auth-helpers-nextjs"
 
@@ -13,10 +13,26 @@ type Props = {
 
 export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }: Props) {
   const supabase = createClientComponentClient()
-  const [url, setUrl] = useState<string | null>(initialUrl ?? null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  // Add a one-time cache-buster to the initial URL so a hard refresh shows latest
+  const bootUrl = useMemo(() => {
+    if (!initialUrl) return null
+    const sep = initialUrl.includes("?") ? "&" : "?"
+    return `${initialUrl}${sep}r=${Date.now()}`
+  }, [initialUrl])
+
+  const [url, setUrl] = useState<string | null>(bootUrl)
   const [busy, setBusy] = useState(false)
   const [overlay, setOverlay] = useState(false) // for touch devices; hover also works
-  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  useEffect(() => {
+    // If initialUrl changes later (e.g., after session refresh), update with a fresh buster
+    if (initialUrl) {
+      const sep = initialUrl.includes("?") ? "&" : "?"
+      setUrl(`${initialUrl}${sep}r=${Date.now()}`)
+    }
+  }, [initialUrl])
 
   const pickFile = () => fileInputRef.current?.click()
 
@@ -30,6 +46,8 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
     canvas.width = target
     canvas.height = target
     const ctx = canvas.getContext("2d")!
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = "high"
     ctx.drawImage(bmp, sx, sy, side, side, 0, 0, target, target)
     return await new Promise((resolve) =>
       canvas.toBlob((b) => resolve(b as Blob), "image/webp", 0.9)
@@ -44,15 +62,29 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
     try {
       setBusy(true)
       const blob = await cropAndCompress(file, 512)
-      const path = `${uid}/avatar.webp`
+
+      // IMPORTANT: path must match your RLS: users/{uid}/...
+      const path = `users/${uid}/avatar.webp`
+
       const { error: upErr } = await supabase.storage
         .from("avatars")
-        .upload(path, blob, { contentType: "image/webp", upsert: true })
-      if (upErr) return
+        .upload(path, blob, {
+          upsert: true,                          // allow overwrite
+          cacheControl: "0",                     // don't cache at edge
+          contentType: "image/webp",
+        })
+      if (upErr) throw upErr
 
       const { data } = supabase.storage.from("avatars").getPublicUrl(path)
+      // cache-bust for the client and CDN
       const publicUrl = data?.publicUrl ? `${data.publicUrl}?v=${Date.now()}` : null
-      await supabase.auth.updateUser({ data: { avatar_url: publicUrl } })
+
+      // Persist to auth metadata (or your own profiles table if you prefer)
+      const { error: metaErr } = await supabase.auth.updateUser({ data: { avatar_url: publicUrl } })
+      if (metaErr) {
+        // you can surface a toast if you want; keeping silent here
+      }
+
       setUrl(publicUrl)
       onUpdated?.(publicUrl)
     } finally {
@@ -64,6 +96,10 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
   const removeAvatar = async () => {
     try {
       setBusy(true)
+      // optional: also delete the file from storage (keeps bucket clean)
+      const path = `users/${uid}/avatar.webp`
+      await supabase.storage.from("avatars").remove([path])
+
       await supabase.auth.updateUser({ data: { avatar_url: null } })
       setUrl(null)
       onUpdated?.(null)
