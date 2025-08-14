@@ -129,50 +129,59 @@ export default function Profile() {
 useEffect(() => {
   let mounted = true
 
-  ;(async () => {
-    setLoadingAuth(true)
+  console.log("[Profile] Mounting Profile page…")
 
-    const { data: { session } } = await supabase.auth.getSession()
+  setLoadingAuth(true)
+  supabase.auth.getSession().then(({ data: { session } }) => {
     const id = session?.user?.id ?? null
+    console.log("[Profile] getSession → id:", id, "session:", session)
+
     if (!mounted) return
 
     if (!id) {
+      console.log("[Profile] No user, resetting state.")
       setUid(null)
       setAvatarUrl(null)
-      setLoadingAuth(false)
       setAssets([])
       setHasMore(false)
       setLoadingAssets(false)
+      setLoadingAuth(false)
     } else {
       setUid(id)
+      console.log("[Profile] Found user id:", id)
 
-      // Always load avatar from mkt_profiles only
-      const { data: prof } = await supabase
+      supabase
         .from("mkt_profiles")
         .select("avatar_url")
         .eq("id", id)
         .single()
+        .then(({ data: prof, error }) => {
+          console.log("[Profile] Avatar query result:", { prof, error })
+          setAvatarUrl(prof?.avatar_url ?? session?.user?.user_metadata?.avatar_url ?? null)
+          setLoadingAuth(false)
+        })
 
-      setAvatarUrl(prof?.avatar_url ?? null)
-
-      setLoadingAuth(false)
-      await Promise.all([fetchFirstPage(id), fetchStripeStatus(id)])
+      console.log("[Profile] Fetching first page and Stripe status…")
+      fetchFirstPage(id)
+      fetchStripeStatus(id)
     }
-  })()
+  })
 
-  // Subscribe once; always refresh from mkt_profiles on auth state change
-  const { data: sub } = supabase.auth.onAuthStateChange(async (_event, s) => {
-    const newId = s?.user?.id
+  const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
+    console.log("[Profile] Auth state change event:", _event, "session:", s)
+    const newId = s?.user?.id ?? null
     if (!newId) return
-    setUid(newId)
 
-    const { data: prof } = await supabase
+    setUid(newId)
+    supabase
       .from("mkt_profiles")
       .select("avatar_url")
       .eq("id", newId)
       .single()
-
-    setAvatarUrl(prof?.avatar_url ?? null)
+      .then(({ data: prof, error }) => {
+        console.log("[Profile] Avatar after state change:", { prof, error })
+        setAvatarUrl(prof?.avatar_url ?? null)
+      })
 
     fetchFirstPage(newId)
     fetchStripeStatus(newId)
@@ -180,10 +189,11 @@ useEffect(() => {
 
   return () => {
     mounted = false
-    sub?.subscription?.unsubscribe()
+    if (sub?.subscription) sub.subscription.unsubscribe()
+    console.log("[Profile] Unmounted.")
   }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [])
+
 
 
   async function fetchFirstPage(userId: string) {
@@ -447,16 +457,19 @@ useEffect(() => {
                     >
                       <CardContent className="p-0">
                         <div className="relative">
-                          <Image
-                            src={a.public_url || "/placeholder.svg"}
-                            alt={a.file_name}
-                            width={800}
-                            height={600}
-                            className="w-full h-64 object-cover"
-                            onError={(e) => {
-                              (e.currentTarget as HTMLImageElement).src = "/placeholder.svg"
-                            }}
-                          />
+                 <Image
+  src={a.public_url || PLACEHOLDER}
+  alt={a.file_name}
+  width={800}
+  height={600}
+  className="w-full h-64 object-cover"
+  onLoad={() => console.log("[Profile] Image loaded:", a.public_url)}
+  onError={(e) => {
+    console.warn("[Profile] Image failed to load:", a.public_url)
+    ;(e.currentTarget as HTMLImageElement).src = PLACEHOLDER
+  }}
+/>
+
                           <Badge className="absolute top-3 left-3 bg-cyber-cyan/20 border border-cyber-cyan/40 text-cyber-cyan">
                             Uploaded
                           </Badge>
