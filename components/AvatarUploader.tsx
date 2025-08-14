@@ -8,14 +8,14 @@ type Props = {
   uid: string
   initialUrl?: string | null
   onUpdated?: (url: string | null) => void
-  size?: number // px
+  size?: number
 }
 
 export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }: Props) {
   const supabase = createClientComponentClient()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  // Add a one-time cache-buster to the initial URL so a hard refresh shows latest
+  // one-time cache-buster for the initial render
   const bootUrl = useMemo(() => {
     if (!initialUrl) return null
     const sep = initialUrl.includes("?") ? "&" : "?"
@@ -24,10 +24,9 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
 
   const [url, setUrl] = useState<string | null>(bootUrl)
   const [busy, setBusy] = useState(false)
-  const [overlay, setOverlay] = useState(false) // for touch devices; hover also works
+  const [overlay, setOverlay] = useState(false)
 
   useEffect(() => {
-    // If initialUrl changes later (e.g., after session refresh), update with a fresh buster
     if (initialUrl) {
       const sep = initialUrl.includes("?") ? "&" : "?"
       setUrl(`${initialUrl}${sep}r=${Date.now()}`)
@@ -49,9 +48,7 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
     ctx.imageSmoothingEnabled = true
     ctx.imageSmoothingQuality = "high"
     ctx.drawImage(bmp, sx, sy, side, side, 0, 0, target, target)
-    return await new Promise((resolve) =>
-      canvas.toBlob((b) => resolve(b as Blob), "image/webp", 0.9)
-    )
+    return await new Promise((resolve) => canvas.toBlob((b) => resolve(b as Blob), "image/webp", 0.9))
   }
 
   const onFile = async (file?: File) => {
@@ -59,31 +56,31 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
     if (!file.type.startsWith("image/")) return
     if (file.size > 5 * 1024 * 1024) return
 
-try {
-    setBusy(true)
-    const blob = await cropAndCompress(file, 512)
+    try {
+      setBusy(true)
+      const blob = await cropAndCompress(file, 512)
 
-    // IMPORTANT: path must match your RLS: users/{uid}/...
-    const path = `users/${uid}/avatar.webp`
+      // path must match RLS: users/{uid}/...
+      const path = `users/${uid}/avatar.webp`
 
-    const { error: upErr } = await supabase.storage
-      .from("avatars")
-      .upload(path, blob, {
-        upsert: true,
-        cacheControl: "0",
-        contentType: "image/webp",
-      })
-      if (upErr) throw upErr
+      const { error: upErr } = await supabase.storage
+        .from("avatars")
+        .upload(path, blob, {
+          upsert: true,
+          cacheControl: "0",
+          contentType: "image/webp",
+        })
+      if (upErr) {
+        console.error("Avatar upload failed:", upErr)
+        return
+      }
 
       const { data } = supabase.storage.from("avatars").getPublicUrl(path)
-      // cache-bust for the client and CDN
       const publicUrl = data?.publicUrl ? `${data.publicUrl}?v=${Date.now()}` : null
 
-      // Persist to auth metadata (or your own profiles table if you prefer)
-      const { error: metaErr } = await supabase.auth.updateUser({ data: { avatar_url: publicUrl } })
-      if (metaErr) {
-        // you can surface a toast if you want; keeping silent here
-      }
+      // mirror to auth metadata for instant UI and to profiles (source of truth)
+      await supabase.auth.updateUser({ data: { avatar_url: publicUrl, picture: publicUrl } })
+      await supabase.from("profiles").upsert({ id: uid, avatar_url: publicUrl })
 
       setUrl(publicUrl)
       onUpdated?.(publicUrl)
@@ -96,11 +93,10 @@ try {
   const removeAvatar = async () => {
     try {
       setBusy(true)
-      // optional: also delete the file from storage (keeps bucket clean)
       const path = `users/${uid}/avatar.webp`
       await supabase.storage.from("avatars").remove([path])
-
-      await supabase.auth.updateUser({ data: { avatar_url: null } })
+      await supabase.auth.updateUser({ data: { avatar_url: null, picture: null } })
+      await supabase.from("profiles").upsert({ id: uid, avatar_url: null })
       setUrl(null)
       onUpdated?.(null)
     } finally {
@@ -112,10 +108,9 @@ try {
     <div
       className="relative group select-none"
       style={{ width: size, height: size }}
-      onClick={() => setOverlay((s) => !s)} // tap support
+      onClick={() => setOverlay((s) => !s)}
       onMouseLeave={() => setOverlay(false)}
     >
-      {/* Circle */}
       <div
         className="relative rounded-full overflow-hidden border-2 border-cyber-green"
         style={{ width: size, height: size }}
@@ -130,13 +125,12 @@ try {
         />
       </div>
 
-      {/* Overlay: appears on hover or when toggled */}
       <div
         className={[
           "absolute inset-0 rounded-full bg-black/65 opacity-0",
           "group-hover:opacity-100",
           overlay ? "opacity-100" : "",
-          "transition-opacity grid place-items-center"
+          "transition-opacity grid place-items-center",
         ].join(" ")}
       >
         {busy ? (
@@ -167,7 +161,6 @@ try {
         )}
       </div>
 
-      {/* Hidden input */}
       <input
         ref={fileInputRef}
         type="file"
