@@ -554,9 +554,7 @@ export default function Profile() {
           <div className="space-y-4">
             <div className="text-sm text-gray-400 break-words">{selectedAsset?.file_name}</div>
             <div>
-              <label className="block text-sm font-medium">Price (USD)</label>
-              <Input value={FIXED_PRICE_USD.toFixed(2)} disabled className="bg-gray-900/40" />
-              {!canSell && (
+                         {!canSell && (
                 <div className="mt-2 text-xs text-cyber-orange">
                   Stripe not connected. Connect your account to list items.
                 </div>
