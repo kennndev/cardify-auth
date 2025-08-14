@@ -59,20 +59,20 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
     if (!file.type.startsWith("image/")) return
     if (file.size > 5 * 1024 * 1024) return
 
-    try {
-      setBusy(true)
-      const blob = await cropAndCompress(file, 512)
+try {
+    setBusy(true)
+    const blob = await cropAndCompress(file, 512)
 
-      // IMPORTANT: path must match your RLS: users/{uid}/...
-      const path = `users/${uid}/avatar.webp`
+    // IMPORTANT: path must match your RLS: users/{uid}/...
+    const path = `users/${uid}/avatar.webp`
 
-      const { error: upErr } = await supabase.storage
-        .from("avatars")
-        .upload(path, blob, {
-          upsert: true,                          // allow overwrite
-          cacheControl: "0",                     // don't cache at edge
-          contentType: "image/webp",
-        })
+    const { error: upErr } = await supabase.storage
+      .from("avatars")
+      .upload(path, blob, {
+        upsert: true,
+        cacheControl: "0",
+        contentType: "image/webp",
+      })
       if (upErr) throw upErr
 
       const { data } = supabase.storage.from("avatars").getPublicUrl(path)
