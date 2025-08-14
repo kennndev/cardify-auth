@@ -18,6 +18,7 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
   const supabase = createClientComponentClient()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
+  // cache-busted initial image
   const bootUrl = useMemo(() => {
     if (!initialUrl) return null
     const sep = initialUrl.includes("?") ? "&" : "?"
@@ -26,7 +27,7 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
 
   const [url, setUrl] = useState<string | null>(bootUrl)
   const [busy, setBusy] = useState(false)
-  const [overlay, setOverlay] = useState(false)
+  const [status, setStatus] = useState<string | null>(null)
 
   useEffect(() => {
     if (!initialUrl) return
@@ -48,7 +49,6 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
     ctx.imageSmoothingEnabled = true
     ctx.imageSmoothingQuality = "high"
     ctx.drawImage(bmp, sx, sy, side, side, 0, 0, target, target)
-
     const blob: Blob = await new Promise((resolve, reject) =>
       canvas.toBlob(b => (b ? resolve(b) : reject(new Error("canvas.toBlob failed"))), "image/webp", 0.9)
     )
@@ -62,86 +62,92 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
       console.error("Avatar too large (>5MB)")
       return
     }
-    if (!uid) {
-      console.error("No uid; user not authenticated")
-      return
-    }
 
+    // Hard timeout in case network hangs
     const controller = new AbortController()
-    const kill = setTimeout(() => controller.abort(), 30_000) // 30s hard timeout
+    const kill = setTimeout(() => controller.abort(), 30_000)
 
     try {
       setBusy(true)
+      setStatus("Processing image…")
 
-      // Make sure session is fresh
+      // Keep session fresh for RLS
       await supabase.auth.refreshSession()
 
       const blob = await cropAndCompress(file, 512)
-      const contentType = blob.type || "image/webp"
       const path = `users/${uid}/avatar.webp`
 
-      console.time("storage.upload(avatar)")
+      setStatus("Uploading…")
+      // @ts-expect-error: upsert is supported in supabase-js v2
       const { error: upErr } = await supabase.storage
         .from("avatars")
-        // @ts-expect-error supabase-js v2 supports upsert in upload options
-        .upload(path, blob, { upsert: true, cacheControl: "0", contentType, signal: controller.signal })
-      console.timeEnd("storage.upload(avatar)")
+        .upload(path, blob, {
+          upsert: true,
+          cacheControl: "0",
+          contentType: blob.type || "image/webp",
+          signal: controller.signal,
+        })
       if (upErr) throw upErr
 
       const { data } = supabase.storage.from("avatars").getPublicUrl(path)
       const publicUrl = data?.publicUrl ? `${data.publicUrl}?v=${Date.now()}` : null
       if (!publicUrl) throw new Error("No public URL returned")
 
-      // Update app profile first (RLS should allow user->own row)
+      setStatus("Saving profile…")
+      // Ensure the row exists; set the URL
       const { error: profErr } = await supabase
         .from("mkt_profiles")
-        .update({ avatar_url: publicUrl })
-        .eq("id", uid)
+        .upsert({ id: uid, avatar_url: publicUrl }, { onConflict: "id" })
       if (profErr) throw profErr
 
-      // Keep auth metadata in sync (best-effort)
-      const { error: metaErr } = await supabase.auth.updateUser({ data: { avatar_url: publicUrl, picture: null } })
-      if (metaErr) console.warn("auth.updateUser metadata warning:", metaErr.message)
+      // Best-effort: sync auth metadata
+      await supabase.auth.updateUser({ data: { avatar_url: publicUrl, picture: null } })
 
       setUrl(publicUrl)
       onUpdated?.(publicUrl)
+      setStatus("Done")
     } catch (e: any) {
-      if (e?.name === "AbortError") {
-        console.error("Upload timed out after 30s")
-      } else {
-        console.error("Avatar upload failed:", e?.message ?? e)
-      }
+      const msg = e?.name === "AbortError" ? "Upload timed out after 30s" : (e?.message ?? "Upload failed")
+      console.error("Avatar upload failed:", msg)
+      setStatus(msg)
     } finally {
       clearTimeout(kill)
       setBusy(false)
       if (fileInputRef.current) fileInputRef.current.value = ""
+      // clear small status message after a moment
+      setTimeout(() => setStatus(null), 3500)
     }
   }
 
   const removeAvatar = async () => {
-    if (!uid) return
-    const path = `users/${uid}/avatar.webp`
+    const controller = new AbortController()
+    const kill = setTimeout(() => controller.abort(), 30_000)
+
     try {
       setBusy(true)
+      setStatus("Removing…")
+      const path = `users/${uid}/avatar.webp`
       await supabase.storage.from("avatars").remove([path])
-      await supabase.from("mkt_profiles").update({ avatar_url: null }).eq("id", uid)
+      await supabase
+        .from("mkt_profiles")
+        .upsert({ id: uid, avatar_url: null }, { onConflict: "id" })
       await supabase.auth.updateUser({ data: { avatar_url: null } })
       setUrl(null)
       onUpdated?.(null)
+      setStatus("Removed")
     } catch (e: any) {
-      console.error("Remove avatar failed:", e?.message ?? e)
+      const msg = e?.message ?? "Remove failed"
+      console.error("Remove avatar failed:", msg)
+      setStatus(msg)
     } finally {
+      clearTimeout(kill)
       setBusy(false)
+      setTimeout(() => setStatus(null), 3500)
     }
   }
 
   return (
-    <div
-      className="relative group select-none"
-      style={{ width: size, height: size }}
-      onClick={() => setOverlay(s => !s)}
-      onMouseLeave={() => setOverlay(false)}
-    >
+    <div className="relative select-none" style={{ width: size }}>
       <div className="relative rounded-full overflow-hidden border-2 border-cyber-green" style={{ width: size, height: size }}>
         <Image
           src={url || FALLBACK_DATA_URL}
@@ -150,34 +156,32 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
           sizes={`${size}px`}
           className="object-cover"
           priority
-          onError={(e) => {
-            // never loop network requests; stick to inline fallback
-            (e.currentTarget as any).src = FALLBACK_DATA_URL
-          }}
+          onError={(e) => ((e.currentTarget as any).src = FALLBACK_DATA_URL)}
         />
       </div>
 
+      {/* Overlay: visible on hover (desktop) or while busy (mobile-safe) */}
       <div
         className={[
-          "absolute inset-0 rounded-full bg-black/65 opacity-0",
-          "group-hover:opacity-100",
-          overlay ? "opacity-100" : "",
-          "transition-opacity grid place-items-center",
+          "absolute inset-0 rounded-full bg-black/65 opacity-0 transition-opacity grid place-items-center",
+          "hover:opacity-100",
+          busy ? "opacity-100" : "",
         ].join(" ")}
+        style={{ height: size }}
       >
         {busy ? (
-          <span className="text-xs text-white">Uploading…</span>
+          <span className="text-xs text-white">{status || "Working…"}</span>
         ) : (
           <div className="flex flex-col items-center gap-2">
             <button
-              onClick={(e) => { e.stopPropagation(); pickFile() }}
+              onClick={pickFile}
               className="px-3 py-1 rounded-full text-xs font-semibold bg-cyber-cyan/20 text-cyber-cyan border border-cyber-cyan/40 hover:bg-cyber-cyan/30"
             >
               Upload photo
             </button>
             {url && (
               <button
-                onClick={(e) => { e.stopPropagation(); removeAvatar() }}
+                onClick={removeAvatar}
                 className="px-3 py-1 rounded-full text-xs font-semibold bg-cyber-pink/20 text-cyber-pink border border-cyber-pink/40 hover:bg-cyber-pink/30"
               >
                 Delete
@@ -187,13 +191,14 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
         )}
       </div>
 
+      {status && !busy && <div className="mt-2 text-xs text-gray-400">{status}</div>}
+
       <input
         ref={fileInputRef}
         type="file"
         accept="image/*"
         className="hidden"
         onChange={(e) => onFile(e.target.files?.[0] || undefined)}
-        onClick={(e) => e.stopPropagation()}
       />
     </div>
   )
