@@ -15,7 +15,6 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
   const supabase = createClientComponentClient()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
-  // one-time cache-buster for the initial render
   const bootUrl = useMemo(() => {
     if (!initialUrl) return null
     const sep = initialUrl.includes("?") ? "&" : "?"
@@ -35,7 +34,6 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
 
   const pickFile = () => fileInputRef.current?.click()
 
-  // center-crop -> 512x512 webp
   const cropAndCompress = async (file: File, target = 512): Promise<Blob> => {
     const bmp = await createImageBitmap(file)
     const side = Math.min(bmp.width, bmp.height)
@@ -48,7 +46,9 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
     ctx.imageSmoothingEnabled = true
     ctx.imageSmoothingQuality = "high"
     ctx.drawImage(bmp, sx, sy, side, side, 0, 0, target, target)
-    return await new Promise((resolve) => canvas.toBlob((b) => resolve(b as Blob), "image/webp", 0.9))
+    return await new Promise((resolve) =>
+      canvas.toBlob((b) => resolve(b as Blob), "image/webp", 0.9)
+    )
   }
 
   const onFile = async (file?: File) => {
@@ -59,28 +59,25 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
     try {
       setBusy(true)
       const blob = await cropAndCompress(file, 512)
-
-      // path must match RLS: users/{uid}/...
       const path = `users/${uid}/avatar.webp`
 
       const { error: upErr } = await supabase.storage
         .from("avatars")
-        .upload(path, blob, {
-          upsert: true,
-          cacheControl: "0",
-          contentType: "image/webp",
-        })
-      if (upErr) {
-        console.error("Avatar upload failed:", upErr)
-        return
-      }
+        .upload(path, blob, { upsert: true, cacheControl: "0", contentType: "image/webp" })
+      if (upErr) throw upErr
 
       const { data } = supabase.storage.from("avatars").getPublicUrl(path)
       const publicUrl = data?.publicUrl ? `${data.publicUrl}?v=${Date.now()}` : null
 
-      // mirror to auth metadata for instant UI and to profiles (source of truth)
-      await supabase.auth.updateUser({ data: { avatar_url: publicUrl, picture: publicUrl } })
-      await supabase.from("profiles").upsert({ id: uid, avatar_url: publicUrl })
+      // write to app DB
+      const { error: profErr } = await supabase
+        .from("mkt_profiles")
+        .update({ avatar_url: publicUrl })
+        .eq("id", uid)
+      if (profErr) throw profErr
+
+      // (optional) also keep auth metadata in sync and clear provider picture
+      await supabase.auth.updateUser({ data: { avatar_url: publicUrl, picture: null } })
 
       setUrl(publicUrl)
       onUpdated?.(publicUrl)
@@ -95,8 +92,10 @@ export default function AvatarUploader({ uid, initialUrl, onUpdated, size = 96 }
       setBusy(true)
       const path = `users/${uid}/avatar.webp`
       await supabase.storage.from("avatars").remove([path])
-      await supabase.auth.updateUser({ data: { avatar_url: null, picture: null } })
-      await supabase.from("profiles").upsert({ id: uid, avatar_url: null })
+
+      await supabase.from("mkt_profiles").update({ avatar_url: null }).eq("id", uid)
+      await supabase.auth.updateUser({ data: { avatar_url: null } })
+
       setUrl(null)
       onUpdated?.(null)
     } finally {
