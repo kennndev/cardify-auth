@@ -6,23 +6,19 @@ const nextConfig = {
   typescript: {
     ignoreBuildErrors: true,
   },
-
-   images: {
-    unoptimized: true, // keep this if you don't want Next to optimize images
+  images: {
+    unoptimized: true,
     remotePatterns: [
-      // ── Supabase Storage (replace with your project ref) ──
-      {
+        {
         protocol: "https",
-        hostname: "<YOUR-PROJECT-REF>.supabase.co",
+        hostname: "emfkmevuacunuqqvijlf.supabase.co",
         pathname: "/storage/v1/object/public/**",
       },
-
-      // ── IPFS Gateways ──
+      // IPFS (keep if needed)
       { protocol: "https", hostname: "coral-perfect-wildebeest-997.mypinata.cloud", pathname: "/**" },
       { protocol: "https", hostname: "gateway.pinata.cloud", pathname: "/ipfs/**" },
       { protocol: "https", hostname: "cloudflare-ipfs.com", pathname: "/ipfs/**" },
       { protocol: "https", hostname: "ipfs.io", pathname: "/ipfs/**" },
-        { protocol: 'https', hostname: 'emfkmevuacunuqqvijlf.supabase.co' },
     ],
   },
   async headers() {
