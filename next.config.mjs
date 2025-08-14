@@ -22,6 +22,7 @@ const nextConfig = {
       { protocol: "https", hostname: "gateway.pinata.cloud", pathname: "/ipfs/**" },
       { protocol: "https", hostname: "cloudflare-ipfs.com", pathname: "/ipfs/**" },
       { protocol: "https", hostname: "ipfs.io", pathname: "/ipfs/**" },
+        { protocol: 'https', hostname: 'emfkmevuacunuqqvijlf.supabase.co' },
     ],
   },
   async headers() {
