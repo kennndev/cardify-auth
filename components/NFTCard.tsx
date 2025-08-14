@@ -9,8 +9,8 @@ import { BASE_SEPOLIA } from '@/hooks/useEnsureNetwork'
 
 type Props = {
   collection: `0x${string}`
-  id:         bigint
-  height?:    number
+  id: bigint
+  height?: number
 }
 
 const GATEWAYS = [
@@ -23,7 +23,7 @@ const GATEWAYS = [
 function ipfsToPath(u: string) {
   if (!u) return ''
   if (u.startsWith('ipfs://')) return u.slice('ipfs://'.length)
-  if (u.startsWith('ipfs:/'))  return u.slice('ipfs:/'.length)
+  if (u.startsWith('ipfs:/')) return u.slice('ipfs:/'.length)
   if (u.startsWith('ipfs://ipfs/')) return u.slice('ipfs://ipfs/'.length)
   return u
 }
@@ -94,14 +94,16 @@ export default function NFTCard({ collection, id, height = 260 }: Props) {
 
   return (
     <div className="rounded overflow-hidden border shadow-sm">
-      <Image
-        src={img}
-        alt={name}
-        width={400}
-        height={height}
-        className="w-full object-cover"
-      />
-      <div className="p-2 text-center text-sm font-medium text-white">
+      <div className="relative w-full h-[260px]"> {/* fixed height for all cards */}
+        <Image
+          src={img}
+          alt={name}
+          fill
+          sizes="(max-width: 768px) 100vw, 400px"
+          className="object-cover"
+        />
+      </div>
+      <div className="p-2 text-center text-sm font-medium text-white truncate">
         {name} — #{id.toString()}
       </div>
     </div>
