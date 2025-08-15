@@ -105,13 +105,14 @@ function MarketplaceCard({
   className="relative grid place-items-center w-10 h-10 rounded-full overflow-hidden border-2 border-cyber-cyan hover:border-cyber-green transition-colors"
 >
   {seller?.avatar_url ? (
-    <Image
-      src={seller.avatar_url}
+      <Image
+           src={seller.avatar_url}
       alt={seller.display_name || 'Seller'}
-      fill
-      sizes="40px"
-      className="object-cover"
-    />
+        fill
+        sizes="(max-width: 1024px) 100vw, 33vw"
+        className="object-contain object-center p-2"
+      />
+ 
   ) : (seller?.display_name && initials(seller.display_name) !== '?') ? (
     <span className="text-cyber-cyan text-sm font-bold">
       {initials(seller.display_name)}
