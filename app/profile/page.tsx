@@ -2,13 +2,14 @@
 
 export const dynamic = "force-dynamic"
 
-import { useEffect, useMemo, useState, useCallback } from "react"
+import { useEffect, useMemo, useState, useCallback, useRef } from "react"
 import Image from "next/image"
 import Link from "next/link"
 import { createClientComponentClient } from "@supabase/auth-helpers-nextjs"
 import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog"
 import { useToast } from "@/hooks/use-toast"
@@ -16,8 +17,16 @@ import { useOwnedCardify } from "@/hooks/useOwnedCardify"
 import NFTCard from "@/components/NFTCard"
 import { WalletButton } from "@/components/WalletConnect"
 import AvatarUploader from "@/components/AvatarUploader"
+import { Pencil, Check, X, Sparkles } from "lucide-react"
 
 const FACTORY = process.env.NEXT_PUBLIC_FACTORY_ADDRESS as `0x${string}`
+
+// Fallback image for broken thumbnails
+const PLACEHOLDER =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="600"><rect width="100%" height="100%" fill="#0b0f19"/><text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#6ee7ff" font-family="monospace" font-size="18">No Preview</text></svg>`
+  )
 
 type AssetRow = {
   id: string
@@ -99,8 +108,33 @@ export default function Profile() {
     [assets]
   )
 
-  // Avatar (driven by AvatarUploader)
+  // Avatar
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null)
+
+  // Profile Name
+  const [displayName, setDisplayName] = useState<string>("")
+  const [nameLoading, setNameLoading] = useState<boolean>(true)
+  const [nameSaving, setNameSaving] = useState<boolean>(false)
+  const [isEditingName, setIsEditingName] = useState<boolean>(false)
+  const [draftName, setDraftName] = useState<string>("")
+
+  // Greeting after save
+  const [greeting, setGreeting] = useState<string | null>(null)
+  const greetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const showGreeting = (name: string) => {
+    const greetings = [
+      `Hey ${name}!`,
+      `Welcome back, ${name}!`,
+      `Nice to see you, ${name}!`,
+      `Great to have you here, ${name}!`,
+    ]
+    const msg = greetings[Math.floor(Math.random() * greetings.length)]
+    setGreeting(msg)
+    if (greetTimeoutRef.current) clearTimeout(greetTimeoutRef.current)
+    greetTimeoutRef.current = setTimeout(() => setGreeting(null), 4000)
+    toast({ title: msg, description: "Your profile name has been updated." })
+  }
 
   async function fetchSellerListings(userId: string, assetIds: string[]) {
     if (assetIds.length === 0) {
@@ -126,75 +160,68 @@ export default function Profile() {
     setListingBySource(map)
   }
 
-useEffect(() => {
-  let mounted = true
+  useEffect(() => {
+    let mounted = true
+    setLoadingAuth(true)
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      const id = session?.user?.id ?? null
+      if (!mounted) return
 
-  console.log("[Profile] Mounting Profile page…")
+      if (!id) {
+        setUid(null)
+        setAvatarUrl(null)
+        setAssets([])
+        setHasMore(false)
+        setLoadingAssets(false)
+        setLoadingAuth(false)
+        setDisplayName("")
+        setNameLoading(false)
+      } else {
+        setUid(id)
 
-  setLoadingAuth(true)
-  supabase.auth.getSession().then(({ data: { session } }) => {
-    const id = session?.user?.id ?? null
-    console.log("[Profile] getSession → id:", id, "session:", session)
+        // Load avatar + name + stripe in one go
+        supabase
+          .from("mkt_profiles")
+          .select("avatar_url, display_name, stripe_verified, stripe_account_id")
+          .eq("id", id)
+          .single()
+          .then(({ data: prof }) => {
+            setAvatarUrl(prof?.avatar_url ?? session?.user?.user_metadata?.avatar_url ?? null)
+            setDisplayName(prof?.display_name ?? "")
+            setStripeVerified(!!prof?.stripe_verified)
+            setStripeAccount(prof?.stripe_account_id ?? null)
+            setNameLoading(false)
+            setLoadingAuth(false)
+          })
 
-    if (!mounted) return
+        fetchFirstPage(id)
+      }
+    })
 
-    if (!id) {
-      console.log("[Profile] No user, resetting state.")
-      setUid(null)
-      setAvatarUrl(null)
-      setAssets([])
-      setHasMore(false)
-      setLoadingAssets(false)
-      setLoadingAuth(false)
-    } else {
-      setUid(id)
-      console.log("[Profile] Found user id:", id)
-
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
+      const newId = s?.user?.id ?? null
+      if (!newId) return
+      setUid(newId)
       supabase
         .from("mkt_profiles")
-        .select("avatar_url")
-        .eq("id", id)
+        .select("avatar_url, display_name, stripe_verified, stripe_account_id")
+        .eq("id", newId)
         .single()
-        .then(({ data: prof, error }) => {
-          console.log("[Profile] Avatar query result:", { prof, error })
-          setAvatarUrl(prof?.avatar_url ?? session?.user?.user_metadata?.avatar_url ?? null)
-          setLoadingAuth(false)
+        .then(({ data: prof }) => {
+          setAvatarUrl(prof?.avatar_url ?? null)
+          setDisplayName(prof?.display_name ?? "")
+          setStripeVerified(!!prof?.stripe_verified)
+          setStripeAccount(prof?.stripe_account_id ?? null)
+          setNameLoading(false)
         })
+      fetchFirstPage(newId)
+    })
 
-      console.log("[Profile] Fetching first page and Stripe status…")
-      fetchFirstPage(id)
-      fetchStripeStatus(id)
+    return () => {
+      if (sub?.subscription) sub.subscription.unsubscribe()
+      if (greetTimeoutRef.current) clearTimeout(greetTimeoutRef.current)
     }
-  })
-
-  const { data: sub } = supabase.auth.onAuthStateChange((_event, s) => {
-    console.log("[Profile] Auth state change event:", _event, "session:", s)
-    const newId = s?.user?.id ?? null
-    if (!newId) return
-
-    setUid(newId)
-    supabase
-      .from("mkt_profiles")
-      .select("avatar_url")
-      .eq("id", newId)
-      .single()
-      .then(({ data: prof, error }) => {
-        console.log("[Profile] Avatar after state change:", { prof, error })
-        setAvatarUrl(prof?.avatar_url ?? null)
-      })
-
-    fetchFirstPage(newId)
-    fetchStripeStatus(newId)
-  })
-
-  return () => {
-    mounted = false
-    if (sub?.subscription) sub.subscription.unsubscribe()
-    console.log("[Profile] Unmounted.")
-  }
-}, [])
-
-
+  }, [])
 
   async function fetchFirstPage(userId: string) {
     setLoadingAssets(true)
@@ -218,21 +245,6 @@ useEffect(() => {
       await fetchSellerListings(userId, mapped.map((a) => a.id))
     }
     setLoadingAssets(false)
-  }
-
-  async function fetchStripeStatus(userId: string) {
-    const { data, error } = await supabase
-      .from("mkt_profiles")
-      .select("stripe_verified, stripe_account_id")
-      .eq("id", userId)
-      .single()
-    if (!error && data) {
-      setStripeVerified(!!data.stripe_verified)
-      setStripeAccount(data.stripe_account_id ?? null)
-    } else {
-      setStripeVerified(false)
-      setStripeAccount(null)
-    }
   }
 
   const signInWithGoogle = async () => {
@@ -365,31 +377,127 @@ useEffect(() => {
     toast({ title: "Listing canceled" })
   }
 
+  // Save Name (no autosave)
+  const saveName = useCallback(
+    async () => {
+      if (!uid) return
+      const name = (draftName || "").trim()
+      if (!name) {
+        toast({ title: "Invalid name", description: "Name cannot be empty.", variant: "destructive" })
+        return
+      }
+      if (name.length > 60) {
+        toast({ title: "Too long", description: "Max 60 characters.", variant: "destructive" })
+        return
+      }
+      setNameSaving(true)
+      const { error } = await supabase
+        .from("mkt_profiles")
+        .upsert({ id: uid, display_name: name }, { onConflict: "id" })
+      setNameSaving(false)
+      if (error) {
+        toast({ title: "Name not saved", description: error.message, variant: "destructive" })
+        return
+      }
+      setDisplayName(name)
+      setIsEditingName(false)
+      showGreeting(name)
+    },
+    [uid, draftName, supabase, toast]
+  )
+
+  // UI
   return (
     <div className="min-h-screen bg-cyber-black relative overflow-hidden font-mono">
       <div className="fixed inset-0 cyber-grid opacity-10 pointer-events-none" />
       <div className="fixed inset-0 scanlines opacity-20 pointer-events-none" />
 
       <div className="px-6 py-8 pt-24 relative max-w-7xl mx-auto">
-        {/* Avatar */}
-        <div className="mb-8">
-          {uid && (
-            <AvatarUploader
-              key={uid}             // remount on account switch
-              uid={uid}
-              initialUrl={avatarUrl}
-              onUpdated={(url) => setAvatarUrl(url)}
-              size={96}
-            />
-          )}
-        </div>
-
-        {/* Header */}
-        <div className="mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div>
-            <h1 className="text-3xl md:text-4xl font-bold text-white tracking-wider">My Cards</h1>
-            <p className="text-gray-400">Your uploaded designs and on-chain Cardify NFTs</p>
+        {/* Inline greeting banner */}
+        {greeting && (
+          <div className="mb-4 flex items-center gap-2 rounded-lg border border-cyber-cyan/40 bg-cyber-dark/60 px-4 py-3 text-cyber-cyan">
+            <Sparkles className="h-4 w-4" />
+            <span className="font-semibold">{greeting}</span>
           </div>
+        )}
+
+        {/* Avatar + Name */}
+        <div className="mb-8 flex flex-col md:flex-row md:items-end md:justify-between gap-6">
+          <div className="flex items-center gap-5">
+            {uid && (
+              <AvatarUploader
+                key={uid}
+                uid={uid}
+                initialUrl={avatarUrl}
+                onUpdated={(url) => setAvatarUrl(url)}
+                size={96}
+              />
+            )}
+
+            <div className="space-y-2">
+              <label className="block text-sm text-gray-400">Name</label>
+
+              {!isEditingName ? (
+                <div className="flex items-center gap-2">
+                  <div
+                    className="min-h-[40px] min-w-[12rem] px-3 py-2 rounded border border-cyber-cyan/30 bg-cyber-dark/60 text-white"
+                    title={displayName || "Click the pencil to set your name"}
+                  >
+                    {nameLoading ? "Loading…" : (displayName || "Add your name")}
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="border border-cyber-cyan/30"
+                    onClick={() => {
+                      setDraftName(displayName || "")
+                      setIsEditingName(true)
+                    }}
+                    disabled={!uid || nameLoading}
+                    aria-label="Edit name"
+                    title="Edit name"
+                  >
+                    <Pencil className="h-4 w-4 text-white" />
+                  </Button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-3">
+                  <Input
+                    value={draftName}
+                    onChange={(e) => setDraftName(e.target.value)}
+                    placeholder="Enter your name"
+                    className="w-72 bg-cyber-dark/60 border border-cyber-cyan/30 text-white"
+                    disabled={!uid}
+                    autoFocus
+                  />
+                  <Button
+                    onClick={saveName}
+                    disabled={!uid || nameSaving}
+                    className="cyber-button"
+                    title="Save name"
+                  >
+                    {nameSaving ? "Saving…" : (<span className="inline-flex items-center gap-1"><Check className="h-4 w-4" /></span>)}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="border-cyber-cyan/40 text-cyber-cyan"
+                    onClick={() => {
+                      setIsEditingName(false)
+                      setDraftName("")
+                    }}
+                    title="Cancel"
+                  >
+                    <X className="h-4 w-4 mr-1" />
+                  </Button>
+                </div>
+              )}
+
+              <div className="text-xs text-gray-500">
+                {!isEditingName ? "Click to edit" : "Save or cancel your changes"}
+              </div>
+            </div>
+          </div>
+
           <div className="flex items-center gap-3">
             {!uid && !loadingAuth ? (
               <Button className="cyber-button" onClick={signInWithGoogle}>
@@ -401,6 +509,14 @@ useEffect(() => {
               </Link>
             )}
           </div>
+        </div>
+
+        {/* Header */}
+        <div className="mb-8">
+          <h1 className="text-3xl md:text-4xl font-bold text-white tracking-wider">
+            {displayName ? `My Cards – ${displayName}` : "My Cards"}
+          </h1>
+          <p className="text-gray-400">Your uploaded designs and on-chain Cardify NFTs</p>
         </div>
 
         {/* Assets */}
@@ -457,18 +573,17 @@ useEffect(() => {
                     >
                       <CardContent className="p-0">
                         <div className="relative">
-                 <Image
-  src={a.public_url || PLACEHOLDER}
-  alt={a.file_name}
-  width={800}
-  height={600}
-  className="w-full h-64 object-cover"
-  onLoad={() => console.log("[Profile] Image loaded:", a.public_url)}
-  onError={(e) => {
-    console.warn("[Profile] Image failed to load:", a.public_url)
-    ;(e.currentTarget as HTMLImageElement).src = PLACEHOLDER
-  }}
-/>
+  <div className="relative w-full h-64 bg-cyber-dark/60 rounded-none">
+  <Image
+    src={a.public_url || PLACEHOLDER}
+    alt={a.file_name}
+    fill
+    sizes="(max-width: 1024px) 100vw, 33vw"
+    className="object-contain object-center p-2"
+    onError={(e) => ((e.currentTarget as HTMLImageElement).src = PLACEHOLDER)}
+  />
+</div>
+
 
                           <Badge className="absolute top-3 left-3 bg-cyber-cyan/20 border border-cyber-cyan/40 text-cyber-cyan">
                             Uploaded
