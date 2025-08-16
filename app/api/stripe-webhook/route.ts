@@ -6,6 +6,8 @@ import { getStripeServer } from "@/lib/stripe"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
+// Optional: extend after() work window if you ever do heavier things
+// export const maxDuration = 10
 
 const stripe = getStripeServer("market")
 
@@ -16,27 +18,9 @@ function getAdmin() {
   return createClient(url, key)
 }
 
-/* -------------- tiny logger that writes to Supabase + console -------------- */
-async function logRow(phase: string, data: { event_id?: string; event_type?: string; msg?: string; details?: any } = {}) {
-  try {
-    console.log(`[wh][${phase}]`, data.msg ?? "", data)
-    const admin = getAdmin()
-    await admin.from("webhook_logs").insert({
-      phase,
-      event_id: data.event_id ?? null,
-      event_type: data.event_type ?? null,
-      msg: data.msg ?? null,
-      details: data.details ?? null,
-    })
-  } catch (e: any) {
-    console.error("[wh][log error]", e?.message)
-  }
-}
-
-/* ---------------- helpers (unchanged, just with step logs) ---------------- */
+/* ---------------- helpers ---------------- */
 
 async function markSellerReadiness(acct: Stripe.Account) {
-  await logRow("step", { event_type: "account.*", msg: "markSellerReadiness", details: { account: acct.id } })
   const admin = getAdmin()
   const verified =
     acct.charges_enabled === true &&
@@ -56,7 +40,7 @@ async function markSellerReadiness(acct: Stripe.Account) {
       },
       { onConflict: "id" }
     )
-    if (error) await logRow("error", { msg: "upsert by userId failed", details: { error: error.message } })
+    if (error) console.error("[wh] upsert by userId failed:", error.message)
   }
 
   const { error: updErr } = await admin
@@ -64,11 +48,10 @@ async function markSellerReadiness(acct: Stripe.Account) {
     .update({ stripe_verified: verified, is_seller: verified })
     .eq("stripe_account_id", acct.id)
 
-  if (updErr) await logRow("error", { msg: "update by stripe_account_id failed", details: { error: updErr.message } })
+  if (updErr) console.error("[wh] update by stripe_account_id failed:", updErr.message)
 }
 
 async function transferAssetToBuyer(listingId: string, buyerId: string) {
-  await logRow("step", { msg: "transferAssetToBuyer start", details: { listingId, buyerId } })
   const admin = getAdmin()
   const { data: listing, error } = await admin
     .from("mkt_listings")
@@ -77,7 +60,7 @@ async function transferAssetToBuyer(listingId: string, buyerId: string) {
     .single()
 
   if (error || !listing) {
-    await logRow("error", { msg: "listing not found", details: { listingId, error: error?.message } })
+    console.warn("[wh] transferAsset: listing not found", listingId, error?.message)
     return
   }
 
@@ -86,8 +69,8 @@ async function transferAssetToBuyer(listingId: string, buyerId: string) {
       .from("user_assets")
       .update({ owner_id: buyerId })
       .eq("id", listing.source_id)
-    if (upErr) await logRow("error", { msg: "transfer asset err", details: { error: upErr.message } })
-    else await logRow("step", { msg: "transfer asset ok", details: { assetId: listing.source_id, buyerId } })
+    if (upErr) console.error("[wh] transferAsset(asset) err:", upErr.message)
+    else console.log("[wh] transferAsset(asset) OK", listing.source_id, "→", buyerId)
     return
   }
 
@@ -96,13 +79,12 @@ async function transferAssetToBuyer(listingId: string, buyerId: string) {
     .update({ owner_id: buyerId })
     .eq("source_type", "uploaded_image")
     .eq("source_id", listing.source_id)
-  if (upErr2) await logRow("error", { msg: "transfer uploaded_image err", details: { error: upErr2.message } })
-  else await logRow("step", { msg: "transfer uploaded_image ok", details: { sourceId: listing.source_id, buyerId } })
+  if (upErr2) console.error("[wh] transferAsset(uploaded_image) err:", upErr2.message)
+  else console.log("[wh] transferAsset(uploaded_image) OK", listing.source_id, "→", buyerId)
 }
 
 async function queuePayoutIfPossible(listingId: string, sellerId?: string | null, netCents?: number) {
   if (!sellerId || !netCents || netCents <= 0) return
-  await logRow("step", { msg: "queuePayoutIfPossible", details: { listingId, sellerId, netCents } })
   const admin = getAdmin()
 
   const { data: seller, error: sellerErr } = await admin
@@ -110,10 +92,10 @@ async function queuePayoutIfPossible(listingId: string, sellerId?: string | null
     .select("stripe_account_id")
     .eq("id", sellerId)
     .single()
-  if (sellerErr) return await logRow("error", { msg: "seller fetch err", details: { error: sellerErr.message } })
+  if (sellerErr) return console.error("[wh] seller fetch err:", sellerErr.message)
   if (!seller?.stripe_account_id) return
 
-  const when = new Date(Date.now() + 10 * 60 * 1000)
+  const when = new Date(Date.now() + 10 * 60 * 1000) // schedule in 10 min (demo)
   const { error: payoutErr } = await admin.from("mkt_payouts").insert({
     listing_id: listingId,
     stripe_account_id: seller.stripe_account_id,
@@ -121,12 +103,12 @@ async function queuePayoutIfPossible(listingId: string, sellerId?: string | null
     scheduled_at: when.toISOString(),
     status: "pending",
   })
-  if (payoutErr) await logRow("error", { msg: "payout insert err", details: { error: payoutErr.message } })
-  else await logRow("step", { msg: "payout queued", details: { listingId, netCents } })
+  if (payoutErr) console.error("[wh] payout insert err:", payoutErr.message)
+  else console.log("[wh] payout queued:", listingId, netCents)
 }
 
-async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
-  await logRow("step", { event_id: pi.id, event_type: "payment_intent.succeeded", msg: "PI handler start", details: { pi_md: pi.metadata } })
+async function handlePaymentIntentSucceededMarketplace(pi: Stripe.PaymentIntent) {
+  console.log("[wh] PI marketplace handler start; md:", pi.metadata)
   const admin = getAdmin()
   const md = (pi.metadata ?? {}) as any
   const listingId = md.mkt_listing_id as string | undefined
@@ -134,7 +116,7 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
   const sellerId = md.mkt_seller_id as string | undefined
 
   if (!listingId || !buyerId) {
-    await logRow("step", { msg: "PI missing marketplace metadata (might be credits flow)", details: { md } })
+    console.warn("[wh] PI missing marketplace metadata", { listingId, buyerId, md })
     return
   }
 
@@ -148,7 +130,7 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
     .update({ status: "completed", updated_at: new Date().toISOString() })
     .eq("stripe_payment_id", stripeId)
     .select("id")
-  if (tx1Err) await logRow("error", { msg: "tx by stripe_id error", details: { error: tx1Err.message } })
+  if (tx1Err) console.error("[wh] tx by stripe_id error:", tx1Err.message)
 
   if (!tx1?.length) {
     const { error: tx2Err } = await admin
@@ -161,7 +143,7 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
       .eq("listing_id", listingId)
       .eq("buyer_id", buyerId)
       .eq("status", "pending")
-    if (tx2Err) await logRow("error", { msg: "tx fallback error", details: { error: tx2Err.message } })
+    if (tx2Err) console.error("[wh] tx fallback error:", tx2Err.message)
   }
 
   const { error: listErr } = await admin
@@ -173,74 +155,91 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
       updated_at: new Date().toISOString(),
     })
     .eq("id", listingId)
-  if (listErr) await logRow("error", { msg: "listing update err", details: { error: listErr.message } })
+  if (listErr) console.error("[wh] listing update err:", listErr.message)
 
   await transferAssetToBuyer(listingId, buyerId)
   await queuePayoutIfPossible(listingId, sellerId, netCents)
 }
 
-async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
-  await logRow("step", { event_type: "checkout.session.completed", msg: "CS handler start", details: { session_id: session.id, md: session.metadata } })
+/* ---------------- credits from Checkout ---------------- */
+
+async function grantCreditsFromSessionLike(obj: {
+  amount_total?: number | null
+  metadata?: Record<string, any> | null
+  payment_intent?: string | Stripe.PaymentIntent | null
+  id?: string
+}) {
   const admin = getAdmin()
-  const md = (session.metadata ?? {}) as any
+  const md = (obj.metadata ?? {}) as any
+  console.log("[wh] credits metadata:", md)
 
   if (md.kind !== "credits_purchase") return
 
   const userId = md.userId as string | undefined
   const credits = parseInt(md.credits ?? "0", 10)
-  const amount_cents = session.amount_total ?? 0
+  const amount_cents = obj.amount_total ?? 0
   const piId =
-    typeof session.payment_intent === "string"
-      ? session.payment_intent
-      : session.payment_intent?.id || session.id
+    typeof obj.payment_intent === "string"
+      ? obj.payment_intent
+      : (obj.payment_intent as Stripe.PaymentIntent | undefined)?.id || obj.id
 
   if (!userId || !credits || credits <= 0) {
-    await logRow("error", { msg: "credits_purchase missing metadata", details: { userId, credits, md } })
+    console.warn("[wh] credits_purchase missing metadata", { userId, credits, md })
     return
   }
 
+  // 1) ledger (idempotent: add a unique key on payment_intent in SQL)
   const { error: insErr } = await admin
     .from("credits_ledger")
-    .insert({ user_id: userId, payment_intent: piId, amount_cents, credits, reason: "purchase" })
+    .insert({
+      user_id: userId,
+      payment_intent: piId,
+      amount_cents,
+      credits,
+      reason: "purchase",
+    })
   if (insErr && (insErr as any).code !== "23505") {
-    await logRow("error", { msg: "ledger insert err", details: { error: insErr.message } })
+    console.error("[wh] ledger insert err:", insErr.message)
   }
 
-  const { error: rpcErr } = await admin.rpc("increment_profile_credits", { p_user_id: userId, p_delta: credits })
+  // 2) increment credits (RPC or fallback)
+  const { error: rpcErr } = await admin.rpc("increment_profile_credits", {
+    p_user_id: userId,
+    p_delta: credits,
+  })
   if (rpcErr) {
-    await logRow("step", { msg: "RPC missing/failed, fallback", details: { rpcErr: rpcErr.message } })
+    console.warn("[wh] RPC missing/failed, fallback:", rpcErr.message)
     const { data: prof, error: readErr } = await admin
       .from("mkt_profiles")
       .select("credits")
       .eq("id", userId)
       .single()
     if (readErr) {
-      const { error: createErr } = await admin.from("mkt_profiles").upsert({ id: userId, credits }, { onConflict: "id" })
-      if (createErr) return await logRow("error", { msg: "upsert profile failed", details: { error: createErr.message } })
+      const { error: createErr } = await admin
+        .from("mkt_profiles")
+        .upsert({ id: userId, credits }, { onConflict: "id" })
+      if (createErr) return console.error("[wh] upsert profile failed:", createErr.message)
     } else {
       const current = Number(prof?.credits ?? 0)
       const { error: upErr } = await admin
         .from("mkt_profiles")
         .upsert({ id: userId, credits: current + credits }, { onConflict: "id" })
-      if (upErr) return await logRow("error", { msg: "credits upsert failed", details: { error: upErr.message } })
+      if (upErr) return console.error("[wh] credits upsert failed:", upErr.message)
     }
   }
 
-  await logRow("step", { msg: "credits granted", details: { userId, credits, payment_intent: piId } })
+  console.log("[wh] credits granted:", { userId, credits, payment_intent: piId })
 }
 
-/* ---------------- webhook route (with after()) ---------------- */
+/* ---------------- webhook route ---------------- */
 
 export async function POST(req: NextRequest) {
-  const t0 = Date.now()
   const rawBody = Buffer.from(await req.arrayBuffer())
   const sig = req.headers.get("stripe-signature") ?? ""
-  await logRow("received", { msg: "webhook hit", details: { len: rawBody.length } })
 
   const primary = process.env.STRIPE_WEBHOOK_SECRET
   const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
   if (!primary && !connect) {
-    await logRow("error", { msg: "webhook secret missing" })
     return new NextResponse("webhook secret missing", { status: 500 })
   }
 
@@ -249,52 +248,75 @@ export async function POST(req: NextRequest) {
     if (primary) {
       event = stripe.webhooks.constructEvent(rawBody, sig, primary)
     } else {
-      throw new Error("no primary secret")
+      throw new Error("no primary")
     }
   } catch (e1: any) {
     if (!connect) {
-      await logRow("error", { msg: "bad sig (primary) and no connect", details: { error: e1?.message } })
+      console.error("[wh] bad signature (primary) & no connect:", e1?.message)
       return new NextResponse("bad sig", { status: 400 })
     }
     try {
       event = stripe.webhooks.constructEvent(rawBody, sig, connect)
     } catch (e2: any) {
-      await logRow("error", { msg: "bad sig (both)", details: { error: e2?.message } })
+      console.error("[wh] bad signature (both):", e2?.message)
       return new NextResponse("bad sig", { status: 400 })
     }
   }
 
-  await logRow("verified", {
-    event_id: event!.id,
-    event_type: event!.type,
-    msg: "signature verified",
-    details: { livemode: event!.livemode, took_ms: Date.now() - t0 },
-  })
+  console.log("[wh] received:", event.type, "id:", event.id, "livemode:", event.livemode)
 
+  // schedule processing after the 200 OK is sent
   after(async () => {
-    await logRow("processing_start", { event_id: event!.id, event_type: event!.type })
     try {
       switch (event!.type) {
-        case "checkout.session.completed":
-          await handleCheckoutSessionCompleted(event!.data.object as Stripe.Checkout.Session)
+        case "checkout.session.completed": {
+          const session = event!.data.object as Stripe.Checkout.Session
+          console.log("[wh] session metadata:", session.metadata)
+          await grantCreditsFromSessionLike({
+            id: session.id,
+            amount_total: session.amount_total,
+            metadata: session.metadata as any,
+            payment_intent: session.payment_intent as any,
+          })
           break
-        case "payment_intent.succeeded":
-          await handlePaymentIntentSucceeded(event!.data.object as Stripe.PaymentIntent)
+        }
+
+        case "payment_intent.succeeded": {
+          const pi = event!.data.object as Stripe.PaymentIntent
+          console.log("[wh] pi metadata:", pi.metadata)
+
+          // Fallback: if this PI is a credits purchase, grant credits here too
+          const md = (pi.metadata ?? {}) as any
+          if (md.kind === "credits_purchase" && md.userId && md.credits) {
+            await grantCreditsFromSessionLike({
+              id: pi.id,
+              amount_total: pi.amount_received ?? pi.amount ?? 0,
+              metadata: md,
+              payment_intent: pi.id,
+            })
+            break
+          }
+
+          // Otherwise: marketplace flow
+          await handlePaymentIntentSucceededMarketplace(pi)
           break
+        }
+
         case "account.updated":
         case "capability.updated":
         case "account.application.authorized":
           await markSellerReadiness(event!.data.object as Stripe.Account)
           break
+
         default:
-          await logRow("step", { event_id: event!.id, event_type: event!.type, msg: "ignored event" })
+          // no-op
           break
       }
-      await logRow("done", { event_id: event!.id, event_type: event!.type })
-    } catch (err: any) {
-      await logRow("error", { event_id: event!.id, event_type: event!.type, msg: "handler error", details: { error: err?.message } })
+    } catch (err) {
+      console.error("[wh] handler error:", err)
     }
   })
 
+  // immediate ACK so Stripe doesn't retry
   return NextResponse.json({ received: true })
 }
