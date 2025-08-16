@@ -4,8 +4,9 @@ import { createClient } from "@supabase/supabase-js"
 import type Stripe from "stripe"
 import { getStripeServer } from "@/lib/stripe"
 
-export const runtime = "nodejs"       // required for raw body access
+export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
+// Optional (Vercel): export const maxDuration = 10
 
 const stripe = getStripeServer("market")
 
@@ -175,7 +176,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     return
   }
 
-  // 1) ledger (idempotent)
+  // 1) ledger (idempotent by unique constraint in SQL)
   const { error: insErr } = await admin
     .from("credits_ledger")
     .insert({
@@ -218,71 +219,78 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
   console.log("[wh] credits granted:", { userId, credits, payment_intent: piId })
 }
 
+/* ---------------- idempotency helpers ---------------- */
+
+async function alreadyProcessed(eventId: string) {
+  const admin = getAdmin()
+  // Try to insert. If conflict, it's already processed.
+  const { error } = await admin
+    .from("webhook_events")
+    .insert({ event_id: eventId, processed_at: new Date().toISOString() })
+  if (!error) return false
+  // 23505 = unique violation
+  if ((error as any).code === "23505") return true
+  console.error("[wh] idempotency insert error:", error.message)
+  // Fail safe: treat as processed to avoid double handling
+  return true
+}
+
 /* ---------------- webhook route ---------------- */
 
 export async function POST(req: NextRequest) {
-  // 1) Read raw body & sig fast
   const rawBody = Buffer.from(await req.arrayBuffer())
   const sig = req.headers.get("stripe-signature") ?? ""
 
-  // 2) Prepare the immediate ACK
-  const ack = NextResponse.json({ received: true })
+  const primary = process.env.STRIPE_WEBHOOK_SECRET
+  const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
+  if (!primary && !connect) {
+    return new NextResponse("webhook secret missing", { status: 500 })
+  }
 
-  // 3) Kick processing to the microtask queue so headers go out immediately
-  queueMicrotask(async () => {
-    const primary = process.env.STRIPE_WEBHOOK_SECRET
-    const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
-
-    if (!primary && !connect) {
-      console.error("[wh] missing webhook secret(s)")
-      return
+  let event: Stripe.Event | null = null
+  try {
+    if (primary) {
+      event = stripe.webhooks.constructEvent(rawBody, sig, primary)
+    } else {
+      throw new Error("no primary secret")
     }
-
-    let event: Stripe.Event | null = null
+  } catch (e1: any) {
+    if (!connect) return new NextResponse("bad sig", { status: 400 })
     try {
-      if (primary) {
-        event = stripe.webhooks.constructEvent(rawBody, sig, primary)
-      } else {
-        throw new Error("no primary secret")
-      }
-    } catch (e1: any) {
-      if (!connect) {
-        console.error("[wh] signature verify failed (primary), no connect:", e1?.message)
-        return
-      }
-      try {
-        event = stripe.webhooks.constructEvent(rawBody, sig, connect)
-      } catch (e2: any) {
-        console.error("[wh] signature verify failed (both):", e2?.message)
-        return
-      }
+      event = stripe.webhooks.constructEvent(rawBody, sig, connect)
+    } catch (e2: any) {
+      return new NextResponse("bad sig", { status: 400 })
     }
+  }
 
-    if (!event) return
-    console.log("[wh] received:", event.type)
+  if (!event) return NextResponse.json({ ignored: true })
 
-    try {
-      switch (event.type) {
-        case "checkout.session.completed":
-          await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
-          break
-        case "payment_intent.succeeded":
-          await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
-          break
-        case "account.updated":
-        case "capability.updated":
-        case "account.application.authorized":
-          await markSellerReadiness(event.data.object as Stripe.Account)
-          break
-        default:
-          // no-op
-          break
-      }
-    } catch (err) {
-      console.error("[wh] handler error:", err)
+  // Idempotency gate
+  if (await alreadyProcessed(event.id)) {
+    return NextResponse.json({ duplicate: true })
+  }
+
+  try {
+    switch (event.type) {
+      case "checkout.session.completed":
+        await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
+        break
+      case "payment_intent.succeeded":
+        await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
+        break
+      case "account.updated":
+      case "capability.updated":
+      case "account.application.authorized":
+        await markSellerReadiness(event.data.object as Stripe.Account)
+        break
+      default:
+        // ignore others
+        break
     }
-  })
+  } catch (err) {
+    console.error("[wh] handler error:", err)
+    // Note: still 200 to avoid Stripe retry storms.
+  }
 
-  // 4) Return the ACK *before* any heavy work
-  return ack
+  return NextResponse.json({ received: true })
 }
