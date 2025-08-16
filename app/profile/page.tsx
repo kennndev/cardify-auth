@@ -634,7 +634,7 @@ export default function Profile() {
                             ) : (
                               <>
                                 <Button className="cyber-button" size="sm" onClick={() => openSell(a)}>
-                                  Sell ($9)
+                                  Sell
                                 </Button>
                                 <a href={a.public_url} target="_blank" rel="noopener noreferrer">
                                   <Button variant="outline" size="sm" className="border-cyber-cyan/40 text-cyber-cyan">
