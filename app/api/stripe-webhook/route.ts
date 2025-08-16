@@ -4,7 +4,8 @@ import { createClient } from "@supabase/supabase-js"
 import type Stripe from "stripe"
 import { getStripeServer } from "@/lib/stripe"
 
-export const runtime = "nodejs" // keep raw body
+export const runtime = "nodejs"          // needed for raw body
+export const dynamic = "force-dynamic"   // avoid static optimization
 
 const stripe = getStripeServer("market")
 
@@ -15,7 +16,7 @@ function getAdmin() {
   return createClient(url, key)
 }
 
-/* ---------------- helpers you already had ---------------- */
+/* ---------------- seller readiness (unchanged) ---------------- */
 
 async function markSellerReadiness(acct: Stripe.Account) {
   const admin = getAdmin()
@@ -44,6 +45,8 @@ async function markSellerReadiness(acct: Stripe.Account) {
     .update({ stripe_verified: verified, is_seller: verified })
     .eq("stripe_account_id", acct.id)
 }
+
+/* ---------------- asset transfer helpers (unchanged) ---------------- */
 
 async function transferAssetToBuyer(listingId: string, buyerId: string) {
   const admin = getAdmin()
@@ -154,7 +157,7 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
   await queuePayoutIfPossible(listingId, sellerId, netCents)
 }
 
-/* ---------------- NEW: credits from Checkout ---------------- */
+/* ---------------- credits via Checkout (unchanged logic) ---------------- */
 
 async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
   const admin = getAdmin()
@@ -176,54 +179,63 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     return
   }
 
-  // 1) ledger (idempotent)
-  const { error: insErr } = await admin
-    .from("credits_ledger")
-    .insert({
-      user_id: userId,
-      payment_intent: piId,
-      amount_cents,
-      credits,
-      reason: "purchase",
-    })
-  if (insErr && (insErr as any).code !== "23505") {
-    console.error("[wh] ledger insert err:", insErr.message)
-    // continue anyway; we still try to grant credits
+  // 1) credits ledger (best-effort idempotency)
+  const ins = await admin.from("credits_ledger").insert({
+    user_id: userId,
+    payment_intent: piId,
+    amount_cents,
+    credits,
+    reason: "purchase",
+  })
+  if (ins.error && (ins.error as any).code !== "23505") {
+    console.error("[wh] ledger insert err:", ins.error.message)
+    // continue; we'll still try to grant credits
   }
 
-  // 2) increment credits (RPC if present, else fallback)
-  const { error: rpcErr } = await admin.rpc("increment_profile_credits", {
+  // 2) increment profile credits via RPC (fallback to upsert)
+  const rpc = await admin.rpc("increment_profile_credits", {
     p_user_id: userId,
     p_delta: credits,
   })
-  if (rpcErr) {
-    console.warn("[wh] RPC missing/failed, fallback:", rpcErr.message)
-    const { data: prof, error: readErr } = await admin
+  if (rpc.error) {
+    console.warn("[wh] RPC missing/failed, fallback:", rpc.error.message)
+    const prof = await admin
       .from("mkt_profiles")
       .select("credits")
       .eq("id", userId)
       .single()
-    if (readErr) {
-      console.error("[wh] read credits failed:", readErr.message)
-      // try to create the row with just credits
-      const { error: createErr } = await admin
+
+    if (prof.error && prof.error.code !== "PGRST116") {
+      console.error("[wh] read credits failed:", prof.error.message)
+      const up = await admin
         .from("mkt_profiles")
         .upsert({ id: userId, credits }, { onConflict: "id" })
-      if (createErr) return console.error("[wh] upsert profile failed:", createErr.message)
+      if (up.error) console.error("[wh] upsert profile failed:", up.error.message)
     } else {
-      const current = Number(prof?.credits ?? 0)
-      const { error: upErr } = await admin
+      const current = Number(prof.data?.credits ?? 0)
+      const up = await admin
         .from("mkt_profiles")
         .upsert({ id: userId, credits: current + credits }, { onConflict: "id" })
-      if (upErr) return console.error("[wh] credits upsert failed:", upErr.message)
+      if (up.error) console.error("[wh] credits upsert failed:", up.error.message)
     }
   }
 
   console.log("[wh] credits granted:", { userId, credits, payment_intent: piId })
 }
 
-/* ---------------- route ---------------- */
+/* ---------------- route handlers ---------------- */
 
+// Health check (lets you open the URL in a browser and see 200)
+export async function GET() {
+  return NextResponse.json({ ok: true, route: "/api/stripe-webhook" })
+}
+
+// Preflight no-op (handy for any proxies)
+export async function OPTIONS() {
+  return new NextResponse(null, { status: 204 })
+}
+
+// Stripe sends POSTs here
 export async function POST(req: NextRequest) {
   const rawBody = Buffer.from(await req.arrayBuffer())
   const sig = req.headers.get("stripe-signature") ?? ""
@@ -234,6 +246,7 @@ export async function POST(req: NextRequest) {
 
   let event: Stripe.Event
   try {
+    // try primary first (platform)
     if (!primary) throw new Error("skip primary")
     event = stripe.webhooks.constructEvent(rawBody, sig, primary)
   } catch (e1) {
@@ -242,6 +255,7 @@ export async function POST(req: NextRequest) {
       return new NextResponse("bad sig", { status: 400 })
     }
     try {
+      // fallback to connect secret
       event = stripe.webhooks.constructEvent(rawBody, sig, connect)
     } catch (e2) {
       console.error("[wh] bad signature (both):", (e2 as any)?.message)
@@ -249,9 +263,9 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  console.log("[wh] received:", event.type) // <— visibility
+  console.log("[wh] received:", event.type)
 
-  // ACK immediately so Stripe won’t retry
+  // ACK immediately; do work async to avoid Stripe timeouts
   const ack = NextResponse.json({ received: true })
 
   ;(async () => {
@@ -260,14 +274,17 @@ export async function POST(req: NextRequest) {
         case "checkout.session.completed":
           await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
           break
+
         case "payment_intent.succeeded":
           await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
           break
+
         case "account.updated":
         case "capability.updated":
         case "account.application.authorized":
           await markSellerReadiness(event.data.object as Stripe.Account)
           break
+
         default:
           break
       }
@@ -278,5 +295,3 @@ export async function POST(req: NextRequest) {
 
   return ack
 }
-
-export const dynamic = "force-dynamic"
