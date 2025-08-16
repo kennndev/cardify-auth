@@ -1,13 +1,11 @@
 // app/api/stripe-webhook/route.ts
-import { NextRequest, NextResponse, unstable_after as after } from "next/server"
+import { NextRequest, NextResponse } from "next/server"
 import { createClient } from "@supabase/supabase-js"
 import type Stripe from "stripe"
 import { getStripeServer } from "@/lib/stripe"
 
-export const runtime = "nodejs"
+export const runtime = "nodejs"       // required for raw body access
 export const dynamic = "force-dynamic"
-// Optional: extend after() work window if you ever do heavier things
-// export const maxDuration = 10
 
 const stripe = getStripeServer("market")
 
@@ -30,7 +28,7 @@ async function markSellerReadiness(acct: Stripe.Account) {
   const userId = (acct.metadata as any)?.user_id as string | undefined
 
   if (userId) {
-    const { error } = await admin.from("mkt_profiles").upsert(
+    await admin.from("mkt_profiles").upsert(
       {
         id: userId,
         email: null,
@@ -40,15 +38,12 @@ async function markSellerReadiness(acct: Stripe.Account) {
       },
       { onConflict: "id" }
     )
-    if (error) console.error("[wh] upsert by userId failed:", error.message)
   }
 
-  const { error: updErr } = await admin
+  await admin
     .from("mkt_profiles")
     .update({ stripe_verified: verified, is_seller: verified })
     .eq("stripe_account_id", acct.id)
-
-  if (updErr) console.error("[wh] update by stripe_account_id failed:", updErr.message)
 }
 
 async function transferAssetToBuyer(listingId: string, buyerId: string) {
@@ -107,8 +102,7 @@ async function queuePayoutIfPossible(listingId: string, sellerId?: string | null
   else console.log("[wh] payout queued:", listingId, netCents)
 }
 
-async function handlePaymentIntentSucceededMarketplace(pi: Stripe.PaymentIntent) {
-  console.log("[wh] PI marketplace handler start; md:", pi.metadata)
+async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
   const admin = getAdmin()
   const md = (pi.metadata ?? {}) as any
   const listingId = md.mkt_listing_id as string | undefined
@@ -116,7 +110,7 @@ async function handlePaymentIntentSucceededMarketplace(pi: Stripe.PaymentIntent)
   const sellerId = md.mkt_seller_id as string | undefined
 
   if (!listingId || !buyerId) {
-    console.warn("[wh] PI missing marketplace metadata", { listingId, buyerId, md })
+    console.warn("[wh] PI missing metadata", { listingId, buyerId, md })
     return
   }
 
@@ -161,34 +155,27 @@ async function handlePaymentIntentSucceededMarketplace(pi: Stripe.PaymentIntent)
   await queuePayoutIfPossible(listingId, sellerId, netCents)
 }
 
-/* ---------------- credits from Checkout ---------------- */
-
-async function grantCreditsFromSessionLike(obj: {
-  amount_total?: number | null
-  metadata?: Record<string, any> | null
-  payment_intent?: string | Stripe.PaymentIntent | null
-  id?: string
-}) {
+async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
   const admin = getAdmin()
-  const md = (obj.metadata ?? {}) as any
-  console.log("[wh] credits metadata:", md)
+  const md = (session.metadata ?? {}) as any
+  console.log("[wh] session metadata:", md)
 
   if (md.kind !== "credits_purchase") return
 
   const userId = md.userId as string | undefined
   const credits = parseInt(md.credits ?? "0", 10)
-  const amount_cents = obj.amount_total ?? 0
+  const amount_cents = session.amount_total ?? 0
   const piId =
-    typeof obj.payment_intent === "string"
-      ? obj.payment_intent
-      : (obj.payment_intent as Stripe.PaymentIntent | undefined)?.id || obj.id
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent?.id || session.id
 
   if (!userId || !credits || credits <= 0) {
     console.warn("[wh] credits_purchase missing metadata", { userId, credits, md })
     return
   }
 
-  // 1) ledger (idempotent: add a unique key on payment_intent in SQL)
+  // 1) ledger (idempotent)
   const { error: insErr } = await admin
     .from("credits_ledger")
     .insert({
@@ -234,80 +221,59 @@ async function grantCreditsFromSessionLike(obj: {
 /* ---------------- webhook route ---------------- */
 
 export async function POST(req: NextRequest) {
+  // 1) Read raw body & sig fast
   const rawBody = Buffer.from(await req.arrayBuffer())
   const sig = req.headers.get("stripe-signature") ?? ""
 
-  const primary = process.env.STRIPE_WEBHOOK_SECRET
-  const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
-  if (!primary && !connect) {
-    return new NextResponse("webhook secret missing", { status: 500 })
-  }
+  // 2) Prepare the immediate ACK
+  const ack = NextResponse.json({ received: true })
 
-  let event: Stripe.Event | null = null
-  try {
-    if (primary) {
-      event = stripe.webhooks.constructEvent(rawBody, sig, primary)
-    } else {
-      throw new Error("no primary")
+  // 3) Kick processing to the microtask queue so headers go out immediately
+  queueMicrotask(async () => {
+    const primary = process.env.STRIPE_WEBHOOK_SECRET
+    const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
+
+    if (!primary && !connect) {
+      console.error("[wh] missing webhook secret(s)")
+      return
     }
-  } catch (e1: any) {
-    if (!connect) {
-      console.error("[wh] bad signature (primary) & no connect:", e1?.message)
-      return new NextResponse("bad sig", { status: 400 })
-    }
+
+    let event: Stripe.Event | null = null
     try {
-      event = stripe.webhooks.constructEvent(rawBody, sig, connect)
-    } catch (e2: any) {
-      console.error("[wh] bad signature (both):", e2?.message)
-      return new NextResponse("bad sig", { status: 400 })
+      if (primary) {
+        event = stripe.webhooks.constructEvent(rawBody, sig, primary)
+      } else {
+        throw new Error("no primary secret")
+      }
+    } catch (e1: any) {
+      if (!connect) {
+        console.error("[wh] signature verify failed (primary), no connect:", e1?.message)
+        return
+      }
+      try {
+        event = stripe.webhooks.constructEvent(rawBody, sig, connect)
+      } catch (e2: any) {
+        console.error("[wh] signature verify failed (both):", e2?.message)
+        return
+      }
     }
-  }
 
-  console.log("[wh] received:", event.type, "id:", event.id, "livemode:", event.livemode)
+    if (!event) return
+    console.log("[wh] received:", event.type)
 
-  // schedule processing after the 200 OK is sent
-  after(async () => {
     try {
-      switch (event!.type) {
-        case "checkout.session.completed": {
-          const session = event!.data.object as Stripe.Checkout.Session
-          console.log("[wh] session metadata:", session.metadata)
-          await grantCreditsFromSessionLike({
-            id: session.id,
-            amount_total: session.amount_total,
-            metadata: session.metadata as any,
-            payment_intent: session.payment_intent as any,
-          })
+      switch (event.type) {
+        case "checkout.session.completed":
+          await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
           break
-        }
-
-        case "payment_intent.succeeded": {
-          const pi = event!.data.object as Stripe.PaymentIntent
-          console.log("[wh] pi metadata:", pi.metadata)
-
-          // Fallback: if this PI is a credits purchase, grant credits here too
-          const md = (pi.metadata ?? {}) as any
-          if (md.kind === "credits_purchase" && md.userId && md.credits) {
-            await grantCreditsFromSessionLike({
-              id: pi.id,
-              amount_total: pi.amount_received ?? pi.amount ?? 0,
-              metadata: md,
-              payment_intent: pi.id,
-            })
-            break
-          }
-
-          // Otherwise: marketplace flow
-          await handlePaymentIntentSucceededMarketplace(pi)
+        case "payment_intent.succeeded":
+          await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
           break
-        }
-
         case "account.updated":
         case "capability.updated":
         case "account.application.authorized":
-          await markSellerReadiness(event!.data.object as Stripe.Account)
+          await markSellerReadiness(event.data.object as Stripe.Account)
           break
-
         default:
           // no-op
           break
@@ -317,6 +283,6 @@ export async function POST(req: NextRequest) {
     }
   })
 
-  // immediate ACK so Stripe doesn't retry
-  return NextResponse.json({ received: true })
+  // 4) Return the ACK *before* any heavy work
+  return ack
 }
