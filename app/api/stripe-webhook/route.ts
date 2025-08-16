@@ -4,20 +4,30 @@ import { createClient } from "@supabase/supabase-js"
 import type Stripe from "stripe"
 import { getStripeServer } from "@/lib/stripe"
 
-export const runtime = "nodejs"          // needed for raw body
-export const dynamic = "force-dynamic"   // avoid static optimization
+export const runtime = "nodejs"
+export const dynamic = "force-dynamic"
 
 const stripe = getStripeServer("market")
 
 function getAdmin() {
+  // Prefer server var; fall back to NEXT_PUBLIC only if needed
   const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
   const key = process.env.SUPABASE_SERVICE_KEY
   if (!url || !key) throw new Error("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY")
-  return createClient(url, key)
+  return createClient(url, key, { auth: { persistSession: false } })
+}
+
+/* ---------- OPTIONAL: simple idempotency guard using event.id ---------- */
+async function ensureNotProcessedYet(eventId: string) {
+  const admin = getAdmin()
+  // create once: create table if not exists webhook_events (id text primary key, created_at timestamptz default now());
+  const { error } = await admin.from("webhook_events").insert({ id: eventId })
+  if (error && !`${error.message}`.includes("duplicate key")) {
+    throw error
+  }
 }
 
 /* ---------------- seller readiness (unchanged) ---------------- */
-
 async function markSellerReadiness(acct: Stripe.Account) {
   const admin = getAdmin()
   const verified =
@@ -26,7 +36,6 @@ async function markSellerReadiness(acct: Stripe.Account) {
     ((acct.requirements?.currently_due ?? []).length === 0)
 
   const userId = (acct.metadata as any)?.user_id as string | undefined
-
   if (userId) {
     await admin.from("mkt_profiles").upsert(
       {
@@ -47,7 +56,6 @@ async function markSellerReadiness(acct: Stripe.Account) {
 }
 
 /* ---------------- asset transfer helpers (unchanged) ---------------- */
-
 async function transferAssetToBuyer(listingId: string, buyerId: string) {
   const admin = getAdmin()
   const { data: listing, error } = await admin
@@ -92,7 +100,7 @@ async function queuePayoutIfPossible(listingId: string, sellerId?: string | null
   if (sellerErr) return console.error("[wh] seller fetch err:", sellerErr.message)
   if (!seller?.stripe_account_id) return
 
-  const when = new Date(Date.now() + 10 * 60 * 1000) // demo
+  const when = new Date(Date.now() + 10 * 60 * 1000)
   const { error: payoutErr } = await admin.from("mkt_payouts").insert({
     listing_id: listingId,
     stripe_account_id: seller.stripe_account_id,
@@ -158,7 +166,6 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
 }
 
 /* ---------------- credits via Checkout (unchanged logic) ---------------- */
-
 async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
   const admin = getAdmin()
   const md = (session.metadata ?? {}) as any
@@ -179,7 +186,8 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     return
   }
 
-  // 1) credits ledger (best-effort idempotency)
+  // Ensure unique on payment_intent to avoid double grants:
+  // create unique index if not exists credits_ledger_payment_intent_idx on credits_ledger(payment_intent);
   const ins = await admin.from("credits_ledger").insert({
     user_id: userId,
     payment_intent: piId,
@@ -187,12 +195,10 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     credits,
     reason: "purchase",
   })
-  if (ins.error && (ins.error as any).code !== "23505") {
+  if (ins.error && !`${ins.error.code}`.includes("23505")) {
     console.error("[wh] ledger insert err:", ins.error.message)
-    // continue; we'll still try to grant credits
   }
 
-  // 2) increment profile credits via RPC (fallback to upsert)
   const rpc = await admin.rpc("increment_profile_credits", {
     p_user_id: userId,
     p_delta: credits,
@@ -225,17 +231,14 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
 
 /* ---------------- route handlers ---------------- */
 
-// Health check (lets you open the URL in a browser and see 200)
 export async function GET() {
   return NextResponse.json({ ok: true, route: "/api/stripe-webhook" })
 }
 
-// Preflight no-op (handy for any proxies)
 export async function OPTIONS() {
   return new NextResponse(null, { status: 204 })
 }
 
-// Stripe sends POSTs here
 export async function POST(req: NextRequest) {
   const rawBody = Buffer.from(await req.arrayBuffer())
   const sig = req.headers.get("stripe-signature") ?? ""
@@ -246,7 +249,6 @@ export async function POST(req: NextRequest) {
 
   let event: Stripe.Event
   try {
-    // try primary first (platform)
     if (!primary) throw new Error("skip primary")
     event = stripe.webhooks.constructEvent(rawBody, sig, primary)
   } catch (e1) {
@@ -255,7 +257,6 @@ export async function POST(req: NextRequest) {
       return new NextResponse("bad sig", { status: 400 })
     }
     try {
-      // fallback to connect secret
       event = stripe.webhooks.constructEvent(rawBody, sig, connect)
     } catch (e2) {
       console.error("[wh] bad signature (both):", (e2 as any)?.message)
@@ -263,35 +264,37 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  console.log("[wh] received:", event.type)
+  console.log("[wh] received:", event.id, event.type)
 
-  // ACK immediately; do work async to avoid Stripe timeouts
-  const ack = NextResponse.json({ received: true })
+  // Idempotency guard (optional but recommended)
+  try {
+    await ensureNotProcessedYet(event.id)
+  } catch (e) {
+    console.warn("[wh] duplicate event, skipping:", event.id)
+    return NextResponse.json({ received: true, deduped: true })
+  }
 
-  ;(async () => {
-    try {
-      switch (event.type) {
-        case "checkout.session.completed":
-          await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
-          break
-
-        case "payment_intent.succeeded":
-          await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
-          break
-
-        case "account.updated":
-        case "capability.updated":
-        case "account.application.authorized":
-          await markSellerReadiness(event.data.object as Stripe.Account)
-          break
-
-        default:
-          break
-      }
-    } catch (err) {
-      console.error("[wh] handler error:", err)
+  try {
+    switch (event.type) {
+      case "checkout.session.completed":
+        await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
+        break
+      case "payment_intent.succeeded":
+        await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
+        break
+      case "account.updated":
+      case "capability.updated":
+      case "account.application.authorized":
+        await markSellerReadiness(event.data.object as Stripe.Account)
+        break
+      default:
+        // Acknowledge unknown events without work
+        break
     }
-  })()
-
-  return ack
+    return NextResponse.json({ received: true })
+  } catch (err) {
+    console.error("[wh] handler error:", err)
+    // Returning 400 lets Stripe retry; if your logic is idempotent, this is fine.
+    return new NextResponse("Webhook error", { status: 400 })
+  }
 }
