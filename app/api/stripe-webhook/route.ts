@@ -4,20 +4,21 @@ import { createClient } from "@supabase/supabase-js"
 import type Stripe from "stripe"
 import { getStripeServer } from "@/lib/stripe"
 
-export const runtime = "nodejs" // ensure raw body available (no body parsing)
+export const runtime = "nodejs" // keep raw body
 
-// ---- Supabase (service role: bypasses RLS) ----
-const admin = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!
-)
-
-// ---- Stripe (your marketplace/platform account) ----
 const stripe = getStripeServer("market")
 
-/* ───────────────── helpers ───────────────── */
+function getAdmin() {
+  const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
+  const key = process.env.SUPABASE_SERVICE_KEY
+  if (!url || !key) throw new Error("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY")
+  return createClient(url, key)
+}
+
+/* ---------------- helpers you already had ---------------- */
 
 async function markSellerReadiness(acct: Stripe.Account) {
+  const admin = getAdmin()
   const verified =
     acct.charges_enabled === true &&
     acct.payouts_enabled === true &&
@@ -44,14 +45,8 @@ async function markSellerReadiness(acct: Stripe.Account) {
     .eq("stripe_account_id", acct.id)
 }
 
-/**
- * Transfer asset ownership to the buyer after a successful sale.
- * Supports both models:
- *  - New: listing.source_type = 'asset' and source_id = user_assets.id
- *  - Legacy: listing.source_type = 'uploaded_image' and user_assets row is (source_type='uploaded_image', source_id=<upload id>)
- */
 async function transferAssetToBuyer(listingId: string, buyerId: string) {
-  // get the source fields we need
+  const admin = getAdmin()
   const { data: listing, error } = await admin
     .from("mkt_listings")
     .select("id, source_type, source_id")
@@ -68,38 +63,33 @@ async function transferAssetToBuyer(listingId: string, buyerId: string) {
       .from("user_assets")
       .update({ owner_id: buyerId })
       .eq("id", listing.source_id)
-    if (upErr) console.error("[wh] transferAsset (asset) err:", upErr.message)
-    else console.log("[wh] transferAsset (asset) OK", listing.source_id, "→", buyerId)
+    if (upErr) console.error("[wh] transferAsset(asset) err:", upErr.message)
+    else console.log("[wh] transferAsset(asset) OK", listing.source_id, "→", buyerId)
     return
   }
 
-  // legacy mapping
   const { error: upErr2 } = await admin
     .from("user_assets")
     .update({ owner_id: buyerId })
     .eq("source_type", "uploaded_image")
     .eq("source_id", listing.source_id)
-  if (upErr2) console.error("[wh] transferAsset (uploaded_image) err:", upErr2.message)
-  else console.log("[wh] transferAsset (uploaded_image) OK", listing.source_id, "→", buyerId)
+  if (upErr2) console.error("[wh] transferAsset(uploaded_image) err:", upErr2.message)
+  else console.log("[wh] transferAsset(uploaded_image) OK", listing.source_id, "→", buyerId)
 }
 
 async function queuePayoutIfPossible(listingId: string, sellerId?: string | null, netCents?: number) {
   if (!sellerId || !netCents || netCents <= 0) return
+  const admin = getAdmin()
 
   const { data: seller, error: sellerErr } = await admin
     .from("mkt_profiles")
     .select("stripe_account_id")
     .eq("id", sellerId)
     .single()
-
-  if (sellerErr) {
-    console.error("[wh] seller fetch err:", sellerErr.message)
-    return
-  }
+  if (sellerErr) return console.error("[wh] seller fetch err:", sellerErr.message)
   if (!seller?.stripe_account_id) return
 
-  const when = new Date(Date.now() + 10 * 60 * 1000) // T+10 min (demo)
-
+  const when = new Date(Date.now() + 10 * 60 * 1000) // demo
   const { error: payoutErr } = await admin.from("mkt_payouts").insert({
     listing_id: listingId,
     stripe_account_id: seller.stripe_account_id,
@@ -112,6 +102,7 @@ async function queuePayoutIfPossible(listingId: string, sellerId?: string | null
 }
 
 async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
+  const admin = getAdmin()
   const md = (pi.metadata ?? {}) as any
   const listingId = md.mkt_listing_id as string | undefined
   const buyerId = md.mkt_buyer_id as string | undefined
@@ -127,13 +118,11 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
   const platformFeeCents = Number(pi.application_fee_amount ?? 0)
   const netCents = Math.max(0, amountCents - platformFeeCents)
 
-  // 1) complete transaction
   const { data: tx1, error: tx1Err } = await admin
     .from("mkt_transactions")
     .update({ status: "completed", updated_at: new Date().toISOString() })
     .eq("stripe_payment_id", stripeId)
     .select("id")
-
   if (tx1Err) console.error("[wh] tx by stripe_id error:", tx1Err.message)
 
   if (!tx1?.length) {
@@ -150,7 +139,6 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
     if (tx2Err) console.error("[wh] tx fallback error:", tx2Err.message)
   }
 
-  // 2) mark listing sold (inactive)
   const { error: listErr } = await admin
     .from("mkt_listings")
     .update({
@@ -162,28 +150,88 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
     .eq("id", listingId)
   if (listErr) console.error("[wh] listing update err:", listErr.message)
 
-  // 3) transfer asset to buyer (works for both 'asset' and 'uploaded_image')
   await transferAssetToBuyer(listingId, buyerId)
-
-  // 4) queue payout (optional demo)
   await queuePayoutIfPossible(listingId, sellerId, netCents)
 }
 
-/* ───────────────── route ───────────────── */
+/* ---------------- NEW: credits from Checkout ---------------- */
+
+async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
+  const admin = getAdmin()
+  const md = (session.metadata ?? {}) as any
+  console.log("[wh] session metadata:", md)
+
+  if (md.kind !== "credits_purchase") return
+
+  const userId = md.userId as string | undefined
+  const credits = parseInt(md.credits ?? "0", 10)
+  const amount_cents = session.amount_total ?? 0
+  const piId =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent?.id || session.id
+
+  if (!userId || !credits || credits <= 0) {
+    console.warn("[wh] credits_purchase missing metadata", { userId, credits, md })
+    return
+  }
+
+  // 1) ledger (idempotent)
+  const { error: insErr } = await admin
+    .from("credits_ledger")
+    .insert({
+      user_id: userId,
+      payment_intent: piId,
+      amount_cents,
+      credits,
+      reason: "purchase",
+    })
+  if (insErr && (insErr as any).code !== "23505") {
+    console.error("[wh] ledger insert err:", insErr.message)
+    // continue anyway; we still try to grant credits
+  }
+
+  // 2) increment credits (RPC if present, else fallback)
+  const { error: rpcErr } = await admin.rpc("increment_profile_credits", {
+    p_user_id: userId,
+    p_delta: credits,
+  })
+  if (rpcErr) {
+    console.warn("[wh] RPC missing/failed, fallback:", rpcErr.message)
+    const { data: prof, error: readErr } = await admin
+      .from("mkt_profiles")
+      .select("credits")
+      .eq("id", userId)
+      .single()
+    if (readErr) {
+      console.error("[wh] read credits failed:", readErr.message)
+      // try to create the row with just credits
+      const { error: createErr } = await admin
+        .from("mkt_profiles")
+        .upsert({ id: userId, credits }, { onConflict: "id" })
+      if (createErr) return console.error("[wh] upsert profile failed:", createErr.message)
+    } else {
+      const current = Number(prof?.credits ?? 0)
+      const { error: upErr } = await admin
+        .from("mkt_profiles")
+        .upsert({ id: userId, credits: current + credits }, { onConflict: "id" })
+      if (upErr) return console.error("[wh] credits upsert failed:", upErr.message)
+    }
+  }
+
+  console.log("[wh] credits granted:", { userId, credits, payment_intent: piId })
+}
+
+/* ---------------- route ---------------- */
 
 export async function POST(req: NextRequest) {
-  // 1) read raw body + signature
   const rawBody = Buffer.from(await req.arrayBuffer())
   const sig = req.headers.get("stripe-signature") ?? ""
 
   const primary = process.env.STRIPE_WEBHOOK_SECRET
   const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
+  if (!primary && !connect) return new NextResponse("webhook secret missing", { status: 500 })
 
-  if (!primary && !connect) {
-    return new NextResponse("webhook secret missing", { status: 500 })
-  }
-
-  // 2) verify against primary first; fall back to connect secret
   let event: Stripe.Event
   try {
     if (!primary) throw new Error("skip primary")
@@ -201,25 +249,26 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // 3) ACK immediately so Stripe doesn't retry while we work
+  console.log("[wh] received:", event.type) // <— visibility
+
+  // ACK immediately so Stripe won’t retry
   const ack = NextResponse.json({ received: true })
 
-  // 4) do the work asynchronously
   ;(async () => {
     try {
       switch (event.type) {
+        case "checkout.session.completed":
+          await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
+          break
         case "payment_intent.succeeded":
           await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
           break
-
         case "account.updated":
         case "capability.updated":
         case "account.application.authorized":
           await markSellerReadiness(event.data.object as Stripe.Account)
           break
-
         default:
-          // other events ignored for now
           break
       }
     } catch (err) {
@@ -229,3 +278,5 @@ export async function POST(req: NextRequest) {
 
   return ack
 }
+
+export const dynamic = "force-dynamic"
