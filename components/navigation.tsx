@@ -18,30 +18,48 @@ import {
 import { canCreateMore, getRemaining, FREE_LIMIT } from "@/lib/guest-quota"
 import { AvatarBubble } from "@/components/Avatar"
 
+/** Simple pill to display current credits (no calculations) */
+function CreditsBadge({ credits }: { credits: number }) {
+  return (
+    <span
+      className="ml-2 inline-flex items-center gap-2 rounded-full border border-cyber-cyan/40 bg-cyber-dark/60 px-3 py-1 text-xs text-cyber-cyan"
+      title={`Credits: ${credits}`}
+    >
+      <span className="font-semibold">Credits</span>
+      <span className="font-mono">{credits}</span>
+    </span>
+  )
+}
+
 export function Navigation() {
   const [isMenuOpen, setIsMenuOpen] = useState(false)
   const [isCartOpen, setIsCartOpen] = useState(false)
   const [user, setUser] = useState<any>(null)
-  const [remaining, setRemaining] = useState<number>(0)
+
+  // guest free counter (unchanged)
+  const [remainingFree, setRemainingFree] = useState<number>(0)
+  const refreshRemainingFree = useCallback(() => setRemainingFree(getRemaining()), [])
+
+  // JUST the paid credits from mkt_profiles.credits
+  const [credits, setCredits] = useState<number>(0)
+
   const isVisible = useNavigationVisibility()
   const { getItemCount } = useCart()
   const itemCount = getItemCount()
 
-  const refreshRemaining = useCallback(() => {
-    setRemaining(getRemaining())
-  }, [])
-
+  // guest free tracking
   useEffect(() => {
-    refreshRemaining()
-    const onUpdate = () => refreshRemaining()
+    refreshRemainingFree()
+    const onUpdate = () => refreshRemainingFree()
     window.addEventListener("cardify-free-updated", onUpdate)
     window.addEventListener("storage", onUpdate)
     return () => {
       window.removeEventListener("cardify-free-updated", onUpdate)
       window.removeEventListener("storage", onUpdate)
     }
-  }, [refreshRemaining])
+  }, [refreshRemainingFree])
 
+  // auth wiring
   useEffect(() => {
     const supabase = getSupabaseBrowserClient()
     supabase.auth.getUser().then(({ data }) => setUser(data.user ?? null))
@@ -50,6 +68,61 @@ export function Navigation() {
       setUser(session?.user ?? null)
     })
     return () => sub.subscription.unsubscribe()
+  }, [])
+
+  // fetch credits directly from mkt_profiles
+  const fetchCredits = useCallback(async () => {
+    if (!user?.id) {
+      setCredits(0)
+      return
+    }
+    const sb = getSupabaseBrowserClient()
+    const { data, error } = await sb
+      .from("mkt_profiles")
+      .select("credits")
+      .eq("id", user.id)
+      .maybeSingle()
+
+    if (error) {
+      setCredits(0)
+      return
+    }
+    setCredits(Number(data?.credits ?? 0))
+  }, [user?.id])
+
+  // initial + on auth change
+  useEffect(() => {
+    fetchCredits()
+  }, [fetchCredits])
+
+  // realtime updates: listen only to mkt_profiles for this user (backup path)
+  useEffect(() => {
+    if (!user?.id) return
+    const sb = getSupabaseBrowserClient()
+    const channel = sb
+      .channel(`credits-${user.id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "mkt_profiles", filter: `id=eq.${user.id}` },
+        () => fetchCredits()
+      )
+      .subscribe()
+
+    return () => {
+      sb.removeChannel(channel)
+    }
+  }, [user?.id, fetchCredits])
+
+  // listen for client-broadcasted updates (primary instant path)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const ce = e as CustomEvent<{ credits: number }>
+      if (typeof ce.detail?.credits === "number") {
+        setCredits(ce.detail.credits)
+      }
+    }
+    window.addEventListener("cardify-credits-updated", handler)
+    return () => window.removeEventListener("cardify-credits-updated", handler)
   }, [])
 
   const handleGuestCreateClick = (path = "/upload") => {
@@ -72,24 +145,37 @@ export function Navigation() {
             <img src="/cardify-currentcolor_svg.svg" alt="Cardify" className="h-6 w-auto" />
           </Link>
 
-          <div className="hidden md:flex items-center gap-4">
+        <div className="hidden md:flex items-center gap-4">
             {/* Create Card */}
             <Button
               onClick={() => handleGuestCreateClick("/upload")}
               className="bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10"
-              title={remaining > 0 ? `You have ${remaining} of ${FREE_LIMIT} free` : "Sign in required"}
+              title={
+                user
+                  ? `Credits: ${credits}`
+                  : remainingFree > 0
+                    ? `You have ${remainingFree} of ${FREE_LIMIT} free`
+                    : "Sign in required"
+              }
             >
               <Sparkles className="w-4 h-4 mr-2" />
-              {remaining > 0 ? `Create Card (${remaining} free)` : "Create Card"}
+              {user
+                ? `Create Card`
+                : remainingFree > 0
+                  ? `Create Card (${remainingFree} free)`
+                  : "Create Card"}
             </Button>
 
-            {/* (Optional) Marketplace – keep/remove per your preference */}
+            {/* Marketplace */}
             <Link href="/marketplace">
               <Button className="bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10">
                 <Sparkles className="w-4 h-4 mr-2" />
                 Marketplace
               </Button>
             </Link>
+
+            {/* Credits pill (signed-in only) */}
+            {user && <CreditsBadge credits={credits} />}
 
             {/* Avatar area */}
             {user ? (
@@ -112,10 +198,12 @@ export function Navigation() {
                       Profile
                     </Link>
                   </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onClick={signOutUser}
-                    className="text-cyber-pink cursor-pointer"
-                  >
+                  <DropdownMenuItem asChild>
+                    <Link href="/credits" className="text-cyber-green">
+                      Buy Credits
+                    </Link>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={signOutUser} className="text-cyber-pink cursor-pointer">
                     Sign out
                   </DropdownMenuItem>
                 </DropdownMenuContent>
@@ -145,16 +233,21 @@ export function Navigation() {
 
           {/* Mobile controls */}
           <div className="flex items-center gap-2 md:hidden">
+            {user && (
+              <span
+                className="text-[11px] px-2 py-1 rounded-full border border-cyber-cyan/40 text-cyber-cyan"
+                title={`Credits: ${credits}`}
+              >
+                Credits: {credits}
+              </span>
+            )}
             <Button
               onClick={() => setIsCartOpen(!isCartOpen)}
               className="relative bg-cyber-dark border-2 border-cyber-cyan text-cyber-cyan p-2"
             >
               <ShoppingCart className="w-4 h-4" />
             </Button>
-            <AnimatedHamburger
-              isOpen={isMenuOpen}
-              onClick={() => setIsMenuOpen(!isMenuOpen)}
-            />
+            <AnimatedHamburger isOpen={isMenuOpen} onClick={() => setIsMenuOpen(!isMenuOpen)} />
           </div>
         </div>
 
@@ -169,13 +262,23 @@ export function Navigation() {
                   handleGuestCreateClick("/upload")
                 }}
                 className="w-full bg-cyber-dark border-2 border-cyber-green text-cyber-green hover:bg-cyber-green/10"
-                title={remaining > 0 ? `You have ${remaining} of ${FREE_LIMIT} free` : "Sign in required"}
+                title={
+                  user
+                    ? `Credits: ${credits}`
+                    : remainingFree > 0
+                      ? `You have ${remainingFree} of ${FREE_LIMIT} free`
+                      : "Sign in required"
+                }
               >
                 <Sparkles className="w-4 h-4 mr-2" />
-                {remaining > 0 ? `Create Card (${remaining} free)` : "Create Card"}
+                {user
+                  ? `Create Card`
+                  : remainingFree > 0
+                    ? `Create Card (${remainingFree} free)`
+                    : "Create Card"}
               </Button>
 
-              {/* (Optional) Marketplace – keep/remove per your preference */}
+              {/* Marketplace */}
               <Link href="/marketplace" className="block">
                 <Button
                   onClick={() => setIsMenuOpen(false)}
@@ -212,6 +315,15 @@ export function Navigation() {
                         className="text-cyber-green"
                       >
                         Profile
+                      </Link>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem asChild>
+                      <Link
+                        href="/credits"
+                        onClick={() => setIsMenuOpen(false)}
+                        className="text-cyber-green"
+                      >
+                        Buy Credits
                       </Link>
                     </DropdownMenuItem>
                     <DropdownMenuItem
