@@ -15,7 +15,7 @@ function siteUrl(path = "") {
   const base =
     process.env.NEXT_PUBLIC_SITE_URL ||
     process.env.SITE_URL ||
-    "http://localhost:3000"
+    "https://cardify-auth.vercel.app"
   return `${base}${path}`
 }
 
