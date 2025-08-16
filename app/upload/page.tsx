@@ -50,6 +50,52 @@ export default function UploadPage() {
 const { toast } = useToast()
 // near other state
 const [remaining, setRemaining] = useState<number>(getRemaining())
+// add near other state
+const [credits, setCredits] = useState<number>(0)
+
+// fetch + subscribe to mkt_profiles.credits
+useEffect(() => {
+  const sb = getSupabaseBrowserClient()
+
+  // initial fetch
+  const init = async () => {
+    const { data: { user } } = await sb.auth.getUser()
+    if (!user?.id) { setCredits(0); return }
+    const { data } = await sb
+      .from("mkt_profiles")
+      .select("credits")
+      .eq("id", user.id)
+      .maybeSingle()
+    setCredits(Number(data?.credits ?? 0))
+  }
+  init()
+
+  // realtime for this user
+  let sub: ReturnType<typeof sb.channel> | null = null
+  const run = async () => {
+    const { data: { user } } = await sb.auth.getUser()
+    if (!user?.id) return
+    sub = sb
+      .channel(`credits-${user.id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "mkt_profiles", filter: `id=eq.${user.id}` },
+        async () => {
+          const { data } = await sb
+            .from("mkt_profiles")
+            .select("credits")
+            .eq("id", user.id)
+            .maybeSingle()
+          setCredits(Number(data?.credits ?? 0))
+        }
+      )
+      .subscribe()
+  }
+  run()
+
+  return () => { if (sub) sb.removeChannel(sub) }
+}, [])
+
 
 useEffect(() => {
   const onUpdate = () => setRemaining(getRemaining())
@@ -196,14 +242,17 @@ useEffect(() => {
 const handleFinalizeClick = async () => {
   if (!uploadedImage || !hasAgreed) return
 
-  // 1) Gate for guests
+  // guests: keep your existing gating
   if (!user && !canCreateMore()) {
-    toast({
-      title: "Sign in required",
-      description: "You’ve used your 3 free creations. Sign in to continue.",
-    })
-    // Send them to /upload after sign-in
+    toast({ title: "Sign in required", description: "You’ve used your 3 free creations. Sign in to continue." })
     signInWithGoogle("/upload")
+    return
+  }
+
+  // if signed-in and no credits, route to buy
+  if (user && credits <= 0) {
+    toast({ title: "No credits", description: "Buy credits to continue." })
+    window.location.href = "/credits"
     return
   }
 
@@ -211,7 +260,7 @@ const handleFinalizeClick = async () => {
   setUploadError(null)
 
   try {
-    // 2) Upload image (your existing code)
+    // uploads (this is where the DB trigger will deduct 1 credit)
     if (!uploadedImageUrl && processedImageBlob) {
       const uploadData = await uploadToSupabase(processedImageBlob)
       setUploadedImageUrl(uploadData.publicUrl)
@@ -221,26 +270,29 @@ const handleFinalizeClick = async () => {
       setUploadedImageUrl(uploadData.publicUrl)
     }
 
-    // 3) Count as a successful creation for guests
- if (!user) {
-  incrementGuestCreation()
-  setRemaining(getRemaining()) // keep badge in sync
-  toast({
-    title: "Created!",
-    description: `You have ${getRemaining()} of ${FREE_LIMIT} free remaining.`,
-  })
-}
+    // guests consume free quota on success (unchanged)
+    if (!user) {
+      incrementGuestCreation()
+      setRemaining(getRemaining())
+      toast({ title: "Created!", description: `You have ${getRemaining()} of ${FREE_LIMIT} free remaining.` })
+    }
 
-
-    // 4) Open checkout modal
     setShowCheckoutModal(true)
-  } catch (error) {
-    console.error('❌ Failed to upload image:', error)
-    setUploadError(error instanceof Error ? error.message : 'Failed to upload image. Please try again.')
+  } catch (error: any) {
+    const msg = String(error?.message || error)
+    if (msg.includes("no_credits") || msg.includes("insufficient_credits")) {
+      // keep storage cleaned (upload.ts already tries remove on failure)
+      toast({ title: "No credits", description: "Buy credits to continue." })
+      // flip UI to Buy Credits state by leaving credits as-is (0)
+    } else {
+      console.error("❌ Failed to upload image:", error)
+      setUploadError('Failed to upload image. Please try again.')
+    }
   } finally {
     setIsUploadingToDatabase(false)
   }
 }
+
 
 
   return (
@@ -408,14 +460,20 @@ const handleFinalizeClick = async () => {
                       onMouseEnter={handleMouseEnter}
                       onMouseLeave={handleMouseLeave}
                     >
-                   <Button
+<Button
   disabled={
     !uploadedImage ||
     !hasAgreed ||
     isUploadingToDatabase ||
     (!user && !canCreateMore())
   }
-  onClick={handleFinalizeClick}
+  onClick={() => {
+    if (user && credits <= 0) {
+      window.location.href = "/credits"
+    } else {
+      handleFinalizeClick()
+    }
+  }}
   className={`w-full text-lg py-6 tracking-wider transition-all duration-300 ${
     uploadedImage && hasAgreed && (user || canCreateMore())
       ? "cyber-button"
@@ -424,22 +482,27 @@ const handleFinalizeClick = async () => {
   title={
     !user && !canCreateMore()
       ? "Free limit reached — sign in to continue"
-      : getTooltipMessage()
+      : user && credits <= 0
+        ? "No credits — buy to continue"
+        : getTooltipMessage()
   }
 >
+  {isUploadingToDatabase ? (
+    <>
+      <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+      Uploading...
+    </>
+  ) : user && credits <= 0 ? (
+    <>Buy Credits</>
+  ) : (
+    <>
+      Finalize
+      <ArrowRight className="w-5 h-5 ml-2" />
+    </>
+  )}
+</Button>
 
-                        {isUploadingToDatabase ? (
-                          <>
-                            <Loader2 className="w-5 h-5 mr-2 animate-spin" />
-                            Uploading...
-                          </>
-                        ) : (
-                          <>
-                            Finalize
-                            <ArrowRight className="w-5 h-5 ml-2" />
-                          </>
-                        )}
-                      </Button>
+
                     </div>
                     {uploadError && (
                       <div className="text-xs text-red-400 bg-red-900/20 border border-red-400/30 rounded px-2 py-1 mt-2">
@@ -524,28 +587,43 @@ const handleFinalizeClick = async () => {
                 
                 {/* Finalize Button */}
                 <div className="flex flex-col sm:flex-row gap-4">
-                  <Button
-                    disabled={!uploadedImage || !hasAgreed || isUploadingToDatabase}
-                    onClick={handleFinalizeClick}
-                    className={`w-full text-lg py-6 tracking-wider transition-all duration-300 ${
-                      uploadedImage && hasAgreed
-                        ? "cyber-button"
-                        : "bg-gray-800 border-2 border-gray-600 text-gray-500 cursor-not-allowed opacity-50"
-                    }`}
-                    title={getTooltipMessage()}
-                  >
-                    {isUploadingToDatabase ? (
-                      <>
-                        <Loader2 className="w-5 h-5 mr-2 animate-spin" />
-                        Uploading...
-                      </>
-                    ) : (
-                      <>
-                        Finalize
-                        <ArrowRight className="w-5 h-5 ml-2" />
-                      </>
-                    )}
-                  </Button>
+      <Button
+  disabled={!uploadedImage || !hasAgreed || isUploadingToDatabase || (!user && !canCreateMore())}
+  onClick={() => {
+    if (user && credits <= 0) {
+      window.location.href = "/credits"
+    } else {
+      handleFinalizeClick()
+    }
+  }}
+  className={`w-full text-lg py-6 tracking-wider transition-all duration-300 ${
+    uploadedImage && hasAgreed && (user || canCreateMore())
+      ? "cyber-button"
+      : "bg-gray-800 border-2 border-gray-600 text-gray-500 cursor-not-allowed opacity-50"
+  }`}
+  title={
+    !user && !canCreateMore()
+      ? "Free limit reached — sign in to continue"
+      : user && credits <= 0
+        ? "No credits — buy to continue"
+        : getTooltipMessage()
+  }
+>
+  {isUploadingToDatabase ? (
+    <>
+      <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+      Uploading...
+    </>
+  ) : user && credits <= 0 ? (
+    <>Buy Credits</>
+  ) : (
+    <>
+      Finalize
+      <ArrowRight className="w-5 h-5 ml-2" />
+    </>
+  )}
+</Button>
+
                 </div>
                 {uploadError && (
                   <div className="text-xs text-red-400 bg-red-900/20 border border-red-400/30 rounded px-2 py-1 mt-2">
