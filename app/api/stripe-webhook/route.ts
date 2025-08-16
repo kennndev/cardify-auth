@@ -4,30 +4,20 @@ import { createClient } from "@supabase/supabase-js"
 import type Stripe from "stripe"
 import { getStripeServer } from "@/lib/stripe"
 
-export const runtime = "nodejs"
+export const runtime = "nodejs"       // required for raw body access
 export const dynamic = "force-dynamic"
 
 const stripe = getStripeServer("market")
 
 function getAdmin() {
-  // Prefer server var; fall back to NEXT_PUBLIC only if needed
   const url = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL
   const key = process.env.SUPABASE_SERVICE_KEY
   if (!url || !key) throw new Error("Missing SUPABASE_URL / SUPABASE_SERVICE_KEY")
-  return createClient(url, key, { auth: { persistSession: false } })
+  return createClient(url, key)
 }
 
-/* ---------- OPTIONAL: simple idempotency guard using event.id ---------- */
-async function ensureNotProcessedYet(eventId: string) {
-  const admin = getAdmin()
-  // create once: create table if not exists webhook_events (id text primary key, created_at timestamptz default now());
-  const { error } = await admin.from("webhook_events").insert({ id: eventId })
-  if (error && !`${error.message}`.includes("duplicate key")) {
-    throw error
-  }
-}
+/* ---------------- helpers ---------------- */
 
-/* ---------------- seller readiness (unchanged) ---------------- */
 async function markSellerReadiness(acct: Stripe.Account) {
   const admin = getAdmin()
   const verified =
@@ -36,6 +26,7 @@ async function markSellerReadiness(acct: Stripe.Account) {
     ((acct.requirements?.currently_due ?? []).length === 0)
 
   const userId = (acct.metadata as any)?.user_id as string | undefined
+
   if (userId) {
     await admin.from("mkt_profiles").upsert(
       {
@@ -55,7 +46,6 @@ async function markSellerReadiness(acct: Stripe.Account) {
     .eq("stripe_account_id", acct.id)
 }
 
-/* ---------------- asset transfer helpers (unchanged) ---------------- */
 async function transferAssetToBuyer(listingId: string, buyerId: string) {
   const admin = getAdmin()
   const { data: listing, error } = await admin
@@ -100,7 +90,7 @@ async function queuePayoutIfPossible(listingId: string, sellerId?: string | null
   if (sellerErr) return console.error("[wh] seller fetch err:", sellerErr.message)
   if (!seller?.stripe_account_id) return
 
-  const when = new Date(Date.now() + 10 * 60 * 1000)
+  const when = new Date(Date.now() + 10 * 60 * 1000) // schedule in 10 min (demo)
   const { error: payoutErr } = await admin.from("mkt_payouts").insert({
     listing_id: listingId,
     stripe_account_id: seller.stripe_account_id,
@@ -165,7 +155,6 @@ async function handlePaymentIntentSucceeded(pi: Stripe.PaymentIntent) {
   await queuePayoutIfPossible(listingId, sellerId, netCents)
 }
 
-/* ---------------- credits via Checkout (unchanged logic) ---------------- */
 async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) {
   const admin = getAdmin()
   const md = (session.metadata ?? {}) as any
@@ -186,115 +175,114 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     return
   }
 
-  // Ensure unique on payment_intent to avoid double grants:
-  // create unique index if not exists credits_ledger_payment_intent_idx on credits_ledger(payment_intent);
-  const ins = await admin.from("credits_ledger").insert({
-    user_id: userId,
-    payment_intent: piId,
-    amount_cents,
-    credits,
-    reason: "purchase",
-  })
-  if (ins.error && !`${ins.error.code}`.includes("23505")) {
-    console.error("[wh] ledger insert err:", ins.error.message)
+  // 1) ledger (idempotent)
+  const { error: insErr } = await admin
+    .from("credits_ledger")
+    .insert({
+      user_id: userId,
+      payment_intent: piId,
+      amount_cents,
+      credits,
+      reason: "purchase",
+    })
+  if (insErr && (insErr as any).code !== "23505") {
+    console.error("[wh] ledger insert err:", insErr.message)
   }
 
-  const rpc = await admin.rpc("increment_profile_credits", {
+  // 2) increment credits (RPC or fallback)
+  const { error: rpcErr } = await admin.rpc("increment_profile_credits", {
     p_user_id: userId,
     p_delta: credits,
   })
-  if (rpc.error) {
-    console.warn("[wh] RPC missing/failed, fallback:", rpc.error.message)
-    const prof = await admin
+  if (rpcErr) {
+    console.warn("[wh] RPC missing/failed, fallback:", rpcErr.message)
+    const { data: prof, error: readErr } = await admin
       .from("mkt_profiles")
       .select("credits")
       .eq("id", userId)
       .single()
-
-    if (prof.error && prof.error.code !== "PGRST116") {
-      console.error("[wh] read credits failed:", prof.error.message)
-      const up = await admin
+    if (readErr) {
+      const { error: createErr } = await admin
         .from("mkt_profiles")
         .upsert({ id: userId, credits }, { onConflict: "id" })
-      if (up.error) console.error("[wh] upsert profile failed:", up.error.message)
+      if (createErr) return console.error("[wh] upsert profile failed:", createErr.message)
     } else {
-      const current = Number(prof.data?.credits ?? 0)
-      const up = await admin
+      const current = Number(prof?.credits ?? 0)
+      const { error: upErr } = await admin
         .from("mkt_profiles")
         .upsert({ id: userId, credits: current + credits }, { onConflict: "id" })
-      if (up.error) console.error("[wh] credits upsert failed:", up.error.message)
+      if (upErr) return console.error("[wh] credits upsert failed:", upErr.message)
     }
   }
 
   console.log("[wh] credits granted:", { userId, credits, payment_intent: piId })
 }
 
-/* ---------------- route handlers ---------------- */
-
-export async function GET() {
-  return NextResponse.json({ ok: true, route: "/api/stripe-webhook" })
-}
-
-export async function OPTIONS() {
-  return new NextResponse(null, { status: 204 })
-}
+/* ---------------- webhook route ---------------- */
 
 export async function POST(req: NextRequest) {
+  // 1) Read raw body & sig fast
   const rawBody = Buffer.from(await req.arrayBuffer())
   const sig = req.headers.get("stripe-signature") ?? ""
 
-  const primary = process.env.STRIPE_WEBHOOK_SECRET
-  const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
-  if (!primary && !connect) return new NextResponse("webhook secret missing", { status: 500 })
+  // 2) Prepare the immediate ACK
+  const ack = NextResponse.json({ received: true })
 
-  let event: Stripe.Event
-  try {
-    if (!primary) throw new Error("skip primary")
-    event = stripe.webhooks.constructEvent(rawBody, sig, primary)
-  } catch (e1) {
-    if (!connect) {
-      console.error("[wh] bad signature (primary) & no connect:", (e1 as any)?.message)
-      return new NextResponse("bad sig", { status: 400 })
+  // 3) Kick processing to the microtask queue so headers go out immediately
+  queueMicrotask(async () => {
+    const primary = process.env.STRIPE_WEBHOOK_SECRET
+    const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
+
+    if (!primary && !connect) {
+      console.error("[wh] missing webhook secret(s)")
+      return
     }
+
+    let event: Stripe.Event | null = null
     try {
-      event = stripe.webhooks.constructEvent(rawBody, sig, connect)
-    } catch (e2) {
-      console.error("[wh] bad signature (both):", (e2 as any)?.message)
-      return new NextResponse("bad sig", { status: 400 })
+      if (primary) {
+        event = stripe.webhooks.constructEvent(rawBody, sig, primary)
+      } else {
+        throw new Error("no primary secret")
+      }
+    } catch (e1: any) {
+      if (!connect) {
+        console.error("[wh] signature verify failed (primary), no connect:", e1?.message)
+        return
+      }
+      try {
+        event = stripe.webhooks.constructEvent(rawBody, sig, connect)
+      } catch (e2: any) {
+        console.error("[wh] signature verify failed (both):", e2?.message)
+        return
+      }
     }
-  }
 
-  console.log("[wh] received:", event.id, event.type)
+    if (!event) return
+    console.log("[wh] received:", event.type)
 
-  // Idempotency guard (optional but recommended)
-  try {
-    await ensureNotProcessedYet(event.id)
-  } catch (e) {
-    console.warn("[wh] duplicate event, skipping:", event.id)
-    return NextResponse.json({ received: true, deduped: true })
-  }
-
-  try {
-    switch (event.type) {
-      case "checkout.session.completed":
-        await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
-        break
-      case "payment_intent.succeeded":
-        await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
-        break
-      case "account.updated":
-      case "capability.updated":
-      case "account.application.authorized":
-        await markSellerReadiness(event.data.object as Stripe.Account)
-        break
-      default:
-        // Acknowledge unknown events without work
-        break
+    try {
+      switch (event.type) {
+        case "checkout.session.completed":
+          await handleCheckoutSessionCompleted(event.data.object as Stripe.Checkout.Session)
+          break
+        case "payment_intent.succeeded":
+          await handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
+          break
+        case "account.updated":
+        case "capability.updated":
+        case "account.application.authorized":
+          await markSellerReadiness(event.data.object as Stripe.Account)
+          break
+        default:
+          // no-op
+          break
+      }
+    } catch (err) {
+      console.error("[wh] handler error:", err)
     }
-    return NextResponse.json({ received: true })
-  } catch (err) {
-    console.error("[wh] handler error:", err)
-    // Returning 400 lets Stripe retry; if your logic is idempotent, this is fine.
-    return new NextResponse("Webhook error", { status: 400 })
-  }
+  })
+
+  // 4) Return the ACK *before* any heavy work
+  return ack
 }
