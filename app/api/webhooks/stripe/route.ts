@@ -186,6 +186,7 @@ interface LogEntry {
   };
 }
 
+
 /**
  * Generate a correlation ID for tracking requests across functions
  */
@@ -208,7 +209,6 @@ function logEvent(entry: Omit<LogEntry, 'timestamp' | 'correlationId'>, correlat
   const logData = {
     ...logEntry,
     ...(logEntry.data && { context: logEntry.data }),
-    ...(logEntry.error && { error: logEntry.error }),
     ...(logEntry.performance && { metrics: logEntry.performance })
   };
 
@@ -558,6 +558,7 @@ function calculateRetryDelay(attempt: number, config: RetryConfig): number {
   return Math.round(finalDelay);
 }
 
+
 /**
  * Execute an operation with retry logic and exponential backoff
  */
@@ -665,6 +666,8 @@ export async function POST(request: NextRequest) {
   // Generate correlation ID for tracking this request
   const correlationId = generateCorrelationId();
   
+    const stripe = getStripeServer('platform'); // or 'market'
+
   // Start performance monitoring
   const startTime = Date.now();
   
@@ -957,8 +960,98 @@ export async function POST(request: NextRequest) {
  * Handle completed checkout sessions
  * This is where we'll process successful purchases
  */
+
+// --- Credits purchase grant (via Checkout Session metadata) ---
+// --- Credits purchase grant (via Checkout Session metadata) ---
+async function handleCreditsPurchase(session: Stripe.Checkout.Session, correlationId: string) {
+  const payment_intent = (session.payment_intent as string) || session.id
+  const userId = session.metadata?.userId as string | undefined
+  const credits = parseInt(session.metadata?.credits || '0', 10)
+  const amount_cents = session.amount_total ?? 0
+
+  if (!userId || !credits || credits <= 0) {
+    logEvent({
+      level: LogLevel.WARN,
+      message: 'Skipping credits purchase (missing metadata)',
+      eventId: session.id,
+      data: { userIdPresent: !!userId, credits }
+    }, correlationId)
+    return
+  }
+
+  // Idempotent: unique on payment_intent
+  const { data: existing, error: selErr } = await supabase
+    .from('credits_ledger')
+    .select('id')
+    .eq('payment_intent', payment_intent)
+    .maybeSingle()
+
+  if (selErr) {
+    logError(
+      ErrorCategory.DATABASE,
+      'Ledger lookup failed',
+      selErr,
+      correlationId,
+      { payment_intent }
+    )
+    throw selErr
+  }
+
+  if (!existing) {
+    const { error: insErr } = await supabase
+      .from('credits_ledger')
+      .insert({
+        user_id: userId,
+        payment_intent,
+        amount_cents,
+        credits,           // positive for purchase
+        reason: 'purchase'
+      })
+
+    // 23505 = unique_violation => already processed (ok to ignore)
+    if (insErr && (insErr as any).code !== '23505') {
+      logError(
+        ErrorCategory.DATABASE,
+        'Ledger insert failed',
+        insErr,
+        correlationId,
+        { payment_intent }
+      )
+      throw insErr
+    }
+
+    // increment balance
+    const { error: rpcErr } = await supabase.rpc('increment_profile_credits', {
+      p_user_id: userId,
+      p_delta: credits
+    })
+    if (rpcErr) {
+      logError(
+        ErrorCategory.DATABASE,
+        'Credit increment failed',
+        rpcErr,
+        correlationId,
+        { userId, credits }
+      )
+      throw rpcErr
+    }
+  }
+
+  logEvent({
+    level: LogLevel.INFO,
+    message: 'Credits granted',
+    eventId: session.id,
+    data: { userId, credits, payment_intent }
+  }, correlationId)
+}
+
+
 async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session, correlationId: string) {
-  const sessionMetrics = startPerformanceMonitoring(session.id, 'checkout.session.completed', session.id);
+  // >>> ADD THIS BLOCK FIRST <<<
+  if (session.metadata?.kind === 'credits_purchase') {
+    await handleCreditsPurchase(session, correlationId)
+    return
+  }  const sessionMetrics = startPerformanceMonitoring(session.id, 'checkout.session.completed', session.id);
   
   logEvent({
     level: LogLevel.INFO,
@@ -1389,6 +1482,7 @@ async function handleCustomCardOrder(session: Stripe.Checkout.Session, uploadId:
     // The payment was successful, so we should acknowledge the webhook
   }
 }
+
 
 /**
  * Store customer data and marketing consent after successful purchase
