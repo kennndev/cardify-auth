@@ -4,9 +4,10 @@ import { createClient } from "@supabase/supabase-js"
 import type Stripe from "stripe"
 import { getStripeServer } from "@/lib/stripe"
 
-export const runtime = "nodejs"
+export const runtime = "nodejs"       // required for raw body access
 export const dynamic = "force-dynamic"
-// Optional (Vercel): export const maxDuration = 10
+// Optional on some hosts to extend execution window
+// export const maxDuration = 10
 
 const stripe = getStripeServer("market")
 
@@ -17,7 +18,7 @@ function getAdmin() {
   return createClient(url, key)
 }
 
-/* ---------------- helpers ---------------- */
+/* ---------------- helpers (unchanged) ---------------- */
 
 async function markSellerReadiness(acct: Stripe.Account) {
   const admin = getAdmin()
@@ -91,7 +92,7 @@ async function queuePayoutIfPossible(listingId: string, sellerId?: string | null
   if (sellerErr) return console.error("[wh] seller fetch err:", sellerErr.message)
   if (!seller?.stripe_account_id) return
 
-  const when = new Date(Date.now() + 10 * 60 * 1000) // schedule in 10 min (demo)
+  const when = new Date(Date.now() + 10 * 60 * 1000) // demo schedule
   const { error: payoutErr } = await admin.from("mkt_payouts").insert({
     listing_id: listingId,
     stripe_account_id: seller.stripe_account_id,
@@ -176,7 +177,7 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
     return
   }
 
-  // 1) ledger (idempotent by unique constraint in SQL)
+  // 1) ledger (idempotent if you made payment_intent unique)
   const { error: insErr } = await admin
     .from("credits_ledger")
     .insert({
@@ -219,28 +220,14 @@ async function handleCheckoutSessionCompleted(session: Stripe.Checkout.Session) 
   console.log("[wh] credits granted:", { userId, credits, payment_intent: piId })
 }
 
-/* ---------------- idempotency helpers ---------------- */
-
-async function alreadyProcessed(eventId: string) {
-  const admin = getAdmin()
-  // Try to insert. If conflict, it's already processed.
-  const { error } = await admin
-    .from("webhook_events")
-    .insert({ event_id: eventId, processed_at: new Date().toISOString() })
-  if (!error) return false
-  // 23505 = unique violation
-  if ((error as any).code === "23505") return true
-  console.error("[wh] idempotency insert error:", error.message)
-  // Fail safe: treat as processed to avoid double handling
-  return true
-}
-
-/* ---------------- webhook route ---------------- */
+/* ---------------- webhook route (serverless-safe) ---------------- */
 
 export async function POST(req: NextRequest) {
+  // 1) Read raw body & signature
   const rawBody = Buffer.from(await req.arrayBuffer())
   const sig = req.headers.get("stripe-signature") ?? ""
 
+  // 2) Verify using prod secrets (primary → connect fallback)
   const primary = process.env.STRIPE_WEBHOOK_SECRET
   const connect = process.env.STRIPE_CONNECT_WEBHOOK_SECRET
   if (!primary && !connect) {
@@ -254,22 +241,18 @@ export async function POST(req: NextRequest) {
     } else {
       throw new Error("no primary secret")
     }
-  } catch (e1: any) {
+  } catch (_e1: any) {
     if (!connect) return new NextResponse("bad sig", { status: 400 })
     try {
       event = stripe.webhooks.constructEvent(rawBody, sig, connect)
-    } catch (e2: any) {
+    } catch (_e2: any) {
       return new NextResponse("bad sig", { status: 400 })
     }
   }
 
   if (!event) return NextResponse.json({ ignored: true })
 
-  // Idempotency gate
-  if (await alreadyProcessed(event.id)) {
-    return NextResponse.json({ duplicate: true })
-  }
-
+  // 3) Handle inline (no background microtasks)
   try {
     switch (event.type) {
       case "checkout.session.completed":
@@ -284,13 +267,14 @@ export async function POST(req: NextRequest) {
         await markSellerReadiness(event.data.object as Stripe.Account)
         break
       default:
-        // ignore others
+        // ignore others, but keep 200 so Stripe doesn't retry needlessly
         break
     }
   } catch (err) {
     console.error("[wh] handler error:", err)
-    // Note: still 200 to avoid Stripe retry storms.
+    // Return 200 anyway to avoid retry storms; handlers should be idempotent.
   }
 
+  // 4) Respond after minimal DB work
   return NextResponse.json({ received: true })
 }
